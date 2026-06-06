@@ -1634,7 +1634,7 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
   const edges: Array<{ x1: number; y1: number; x2: number; y2: number; kind: "chance" | "decision"; tile: number }> = [];
   const optionLists: Array<{ x: number; y: number; kind: "chance" | "decision"; title: string; rows: Array<{ tile: number; text: string }> }> = [];
 
-  let maxOptionListColumns = 0;
+  let maxOptionListColumns = 3;
 
   let currentY = startY;
   childRows.forEach(({ child, optionList, height }) => {
