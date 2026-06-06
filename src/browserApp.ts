@@ -1182,8 +1182,8 @@ function renderGraphSvg(
 
     if (item.branchTile !== undefined) {
       const tile = document.createElementNS(svgNS, "text");
-      tile.setAttribute("x", "10");
-      tile.setAttribute("y", "42");
+      tile.setAttribute("x", "15");
+      tile.setAttribute("y", "50");
       tile.setAttribute("class", "svg-card-tile");
       tile.textContent = tileLigature(item.branchTile);
       group.append(tile);
@@ -1609,10 +1609,7 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
     };
   });
 
-  const totalChildrenHeight = childRows.length > 0
-    ? childRows.reduce((sum, row) => sum + row.height, 0) + (childRows.length - 1) * rowGap
-    : GRAPH_NODE_HEIGHT;
-  const rootY = startY + Math.max(0, (totalChildrenHeight - GRAPH_NODE_HEIGHT) / 2);
+  const rootY = startY;
 
   const cards: Array<{
     x: number;
@@ -1711,7 +1708,7 @@ function graphCardFromNode(
     lines,
     branchTile: isRoot ? undefined : parseBranchTile(branchLabel),
     contentX,
-    lineStartY: isRoot ? 38 : hasChildTitle ? 46 : 32,
+    lineStartY: isRoot ? 38 : hasChildTitle ? 36 : 22,
     nodeId: node.id
   };
 }
