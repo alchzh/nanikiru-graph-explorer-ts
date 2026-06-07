@@ -1,19 +1,26 @@
 import { MeldType, ShantenFlag, Tile } from "./constants.js";
-import { BruteForceMahjongEngine } from "./analyzers.js";
-import { ExpectedScoreCalculatorTs } from "./expectedScoreCalculator.js";
 import {
   CalculationResult,
   Config,
   Count,
+  EdgeKind,
   createDefaultConfig,
   createDefaultRound,
   EdgeTurnBreakdown,
+  NodeId,
+  NodePhase,
   Player,
-  SearchNode
+  SearchNode,
+  TileBreakdown,
+  TileOutcome
 } from "./model.js";
-import { TypeScriptScoreEngine } from "./scoreCalculator.js";
 import { createTileImg, createTileText, tileLigature } from "./tileArtwork.js";
 import { countToTileIds, parseTile, tileName, tilesToHand } from "./utils.js";
+import type {
+  ExpectedScoreCalculationPayload,
+  ExpectedScoreWorkerRequest,
+  ExpectedScoreWorkerResponse
+} from "./workerProtocol.js";
 
 type EditTarget = "hand" | "dora" | "pon" | "chii" | "minkan" | "ankan" | "wall";
 
@@ -69,6 +76,8 @@ interface AppState {
   result?: CalculationResult;
   graphResult?: CalculationResult;
   selectedTurn: number;
+  isComputing: boolean;
+  computingLabel?: string;
   error?: string;
 }
 
@@ -84,11 +93,11 @@ const GRAPH_COMPACT_OPTION_TILE_STEP = 28;
 interface GraphOptionRow {
   tile: number;
   text?: string;
-  nodeId?: string;
+  nodeId?: NodeId;
 }
 
 interface GraphOptionList {
-  kind: "chance" | "decision";
+  kind: EdgeKind;
   title: string;
   rows: GraphOptionRow[];
   compact?: boolean;
@@ -101,9 +110,22 @@ type FocusedGraphChild =
       tile: number;
       probability: number;
       immediateScore: number;
-      edgeKind: "chance" | "decision";
+      edgeKind: EdgeKind;
       sortEv: number;
       title: string | undefined;
+    }
+  | {
+      kind: "draw-outcome";
+      tile: number;
+      probability: number;
+      evContribution: number;
+      averageValue: number;
+      winProbability: number;
+      averageBaseValue: number;
+      averageUradoraHitProbability: number;
+      outcome: TileBreakdown["outcome"];
+      edgeKind: EdgeKind.Chance;
+      targetNode?: SearchNode;
     }
   | {
       kind: "agari";
@@ -112,14 +134,15 @@ type FocusedGraphChild =
       immediateScore: number;
       baseScore: number;
       uradoraHitProbability: number;
-      edgeKind: "chance" | "decision";
+      edgeKind: EdgeKind;
       evContribution: number;
       aggregate?: boolean;
     }
   | {
       kind: "aggregate";
-      edgeKind: "chance";
+      edgeKind: EdgeKind.Chance;
       probability: number;
+      evContribution?: number;
       averageExpScore: number;
       averageWin: number;
       averageTenpai: number;
@@ -161,86 +184,183 @@ const TILE_GROUPS: Array<{ label: string; tiles: number[] }> = [
 ];
 
 export function mountBrowserApp(root: HTMLElement): void {
-  const calculator = new ExpectedScoreCalculatorTs();
-  const shantenEngine = new BruteForceMahjongEngine();
-  const engine = new BruteForceMahjongEngine({ scoring: new TypeScriptScoreEngine(shantenEngine) });
+  const worker = new Worker(new URL("./expectedScoreWorker.js", import.meta.url), { type: "module" });
+  let nextWorkerRequestId = 1;
+  let computationToken = 0;
 
   const initialEditor = scenarioToEditorState(SAMPLE_SCENARIO);
   const state: AppState = {
     editor: initialEditor,
     jsonDraft: JSON.stringify(editorStateToScenario(initialEditor), null, 2),
-    selectedTurn: initialEditor.currentTurn
+    selectedTurn: initialEditor.currentTurn,
+    isComputing: false
   };
 
   const rerender = (): void => {
     root.innerHTML = "";
+    root.classList.toggle("is-computing", state.isComputing);
+    root.setAttribute("aria-busy", state.isComputing ? "true" : "false");
     const layout = document.createElement("div");
     layout.className = "layout";
     layout.append(renderControls(state, rerender, runAnalysis), renderResults(state, rerender, focusGraphOnNode));
+    setInteractionDisabled(layout, state.isComputing);
     root.append(layout);
   };
 
-  const focusGraphOnNode = (node?: SearchNode): void => {
+  const calculateInWorker = (payload: ExpectedScoreCalculationPayload): Promise<CalculationResult> => {
+    const id = nextWorkerRequestId;
+    nextWorkerRequestId += 1;
+
+    return new Promise((resolve, reject) => {
+      const cleanup = (): void => {
+        worker.removeEventListener("message", handleMessage);
+        worker.removeEventListener("error", handleError);
+      };
+      const handleMessage = (event: MessageEvent<ExpectedScoreWorkerResponse>): void => {
+        if (event.data.id !== id) {
+          return;
+        }
+        cleanup();
+        if (event.data.ok) {
+          resolve(event.data.result);
+        } else {
+          reject(new Error(event.data.error));
+        }
+      };
+      const handleError = (event: ErrorEvent): void => {
+        cleanup();
+        reject(new Error(event.message || "Expected score worker failed."));
+      };
+      worker.addEventListener("message", handleMessage);
+      worker.addEventListener("error", handleError);
+      worker.postMessage({ ...payload, id, kind: "calculate" } satisfies ExpectedScoreWorkerRequest);
+    });
+  };
+
+  const snapshotInWorker = (rootNodeId: NodeId, graphDepthLimit: number): Promise<CalculationResult> => {
+    const id = nextWorkerRequestId;
+    nextWorkerRequestId += 1;
+
+    return new Promise((resolve, reject) => {
+      const cleanup = (): void => {
+        worker.removeEventListener("message", handleMessage);
+        worker.removeEventListener("error", handleError);
+      };
+      const handleMessage = (event: MessageEvent<ExpectedScoreWorkerResponse>): void => {
+        if (event.data.id !== id) {
+          return;
+        }
+        cleanup();
+        if (event.data.ok) {
+          resolve(event.data.result);
+        } else {
+          reject(new Error(event.data.error));
+        }
+      };
+      const handleError = (event: ErrorEvent): void => {
+        cleanup();
+        reject(new Error(event.message || "Expected score worker failed."));
+      };
+      worker.addEventListener("message", handleMessage);
+      worker.addEventListener("error", handleError);
+      worker.postMessage({ id, kind: "snapshot", rootNodeId, graphDepthLimit } satisfies ExpectedScoreWorkerRequest);
+    });
+  };
+
+  const focusGraphOnNode = async (node?: SearchNode): Promise<void> => {
     if (!state.result || !node) {
       return;
     }
     const currentGraph = state.graphResult ?? state.result;
-    const currentRoot = currentGraph.rootNodeId
+    const currentRoot = currentGraph.rootNodeId !== undefined
       ? currentGraph.nodes.find((candidate) => candidate.id === currentGraph.rootNodeId)
       : undefined;
     if (currentRoot) {
       state.selectedTurn = transitionTurn(currentRoot.phase, node.phase, state.selectedTurn, state.editor.config.tMax);
     }
-    state.graphResult = undefined;
-    const rootConfig = {
-      ...state.editor.config,
-      sum: state.result.context.rootWallCount
-    };
-    const player = buildPlayerFromEditor(state.editor);
-    state.graphResult = calculator.calc(
-      rootConfig,
-      state.editor.round,
-      player,
-      engine,
-      state.editor.wall,
-      {
-        graphDepthLimit: GRAPH_SNAPSHOT_DEPTH,
-        startNode: node,
-        originHand: state.result.context.originHand,
-        originShanten: state.result.context.originShanten
+    const token = computationToken + 1;
+    computationToken = token;
+    state.error = undefined;
+    state.isComputing = true;
+    state.computingLabel = "Loading graph...";
+    rerender();
+
+    try {
+      const graphResult = await snapshotInWorker(node.id, GRAPH_SNAPSHOT_DEPTH);
+      if (token !== computationToken) {
+        return;
       }
-    );
+      state.graphResult = graphResult;
+    } catch (error) {
+      if (token !== computationToken) {
+        return;
+      }
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (token === computationToken) {
+        state.isComputing = false;
+        state.computingLabel = undefined;
+        rerender();
+      }
+    }
   };
 
-  const runAnalysis = (): void => {
+  const runAnalysis = async (): Promise<void> => {
+    const token = computationToken + 1;
+    computationToken = token;
     state.error = undefined;
+    state.isComputing = true;
+    state.computingLabel = "Analyzing...";
+    rerender();
+
     try {
       syncTurnConfig(state.editor);
       const player = buildPlayerFromEditor(state.editor);
-      const result = calculator.calc(
-        state.editor.config,
-        state.editor.round,
+      const result = await calculateInWorker({
+        config: state.editor.config,
+        round: state.editor.round,
         player,
-        engine,
-        state.editor.wall,
-        { graphDepthLimit: GRAPH_SNAPSHOT_DEPTH }
-      );
+        wall: state.editor.wall,
+        options: { graphDepthLimit: GRAPH_SNAPSHOT_DEPTH }
+      });
+      if (token !== computationToken) {
+        return;
+      }
       state.result = result;
       state.selectedTurn = state.editor.currentTurn;
       state.graphResult = undefined;
       state.jsonDraft = JSON.stringify(editorStateToScenario(state.editor), null, 2);
     } catch (error) {
+      if (token !== computationToken) {
+        return;
+      }
       state.result = undefined;
       state.graphResult = undefined;
       state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (token === computationToken) {
+        state.isComputing = false;
+        state.computingLabel = undefined;
+        rerender();
+      }
     }
-    rerender();
   };
 
   rerender();
 }
 
-function renderControls(state: AppState, rerender: () => void, runAnalysis: () => void): HTMLElement {
+function setInteractionDisabled(container: HTMLElement, disabled: boolean): void {
+  if (!disabled) {
+    return;
+  }
+  container
+    .querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("button,input,select,textarea")
+    .forEach((control) => {
+      control.disabled = true;
+    });
+}
+
+function renderControls(state: AppState, rerender: () => void, runAnalysis: () => Promise<void>): HTMLElement {
   const section = document.createElement("section");
   section.className = "controls";
 
@@ -263,8 +383,10 @@ function renderControls(state: AppState, rerender: () => void, runAnalysis: () =
   actions.className = "button-row editor-actions";
 
   const analyze = document.createElement("button");
-  analyze.textContent = "Analyze";
-  analyze.addEventListener("click", runAnalysis);
+  analyze.textContent = state.isComputing ? (state.computingLabel ?? "Computing...") : "Analyze";
+  analyze.addEventListener("click", () => {
+    void runAnalysis();
+  });
 
   const reset = document.createElement("button");
   reset.className = "secondary";
@@ -278,6 +400,12 @@ function renderControls(state: AppState, rerender: () => void, runAnalysis: () =
   });
 
   actions.append(analyze, reset);
+  if (state.isComputing) {
+    const status = document.createElement("span");
+    status.className = "busy-status";
+    status.textContent = state.computingLabel ?? "Computing...";
+    actions.append(status);
+  }
   editor.append(actions);
 
   section.append(editor);
@@ -1023,7 +1151,7 @@ function renderConfigControls(state: AppState, rerender: () => void): HTMLElemen
   return wrap;
 }
 
-function renderJsonPanel(state: AppState, rerender: () => void, runAnalysis: () => void): HTMLElement {
+function renderJsonPanel(state: AppState, rerender: () => void, runAnalysis: () => Promise<void>): HTMLElement {
   const details = document.createElement("details");
   details.className = "json-panel";
   details.innerHTML = "<summary><span>Advanced JSON</span><span class='muted'>import or inspect the full scenario</span></summary>";
@@ -1044,7 +1172,7 @@ function renderJsonPanel(state: AppState, rerender: () => void, runAnalysis: () 
   apply.addEventListener("click", () => {
     const scenario = JSON.parse(state.jsonDraft) as ScenarioInput;
     state.editor = scenarioToEditorState(scenario);
-    runAnalysis();
+    void runAnalysis();
   });
   const refresh = document.createElement("button");
   refresh.className = "secondary";
@@ -1060,7 +1188,7 @@ function renderJsonPanel(state: AppState, rerender: () => void, runAnalysis: () 
   return details;
 }
 
-function renderResults(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => void): HTMLElement {
+function renderResults(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => Promise<void>): HTMLElement {
   const section = document.createElement("section");
   section.className = "results";
 
@@ -1101,14 +1229,14 @@ function renderSummary(result: CalculationResult): HTMLElement {
   return section;
 }
 
-function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => void): HTMLElement {
+function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => Promise<void>): HTMLElement {
   const section = document.createElement("section");
   section.className = "panel section";
   section.innerHTML = "<h2>Game tree graph</h2>";
 
   const graphResult = state.graphResult ?? state.result;
   const focusId = graphResult?.rootNodeId;
-  const focusNode = focusId && graphResult
+  const focusNode = focusId !== undefined && graphResult
     ? graphResult.nodes.find((node) => node.id === focusId)
     : undefined;
 
@@ -1138,10 +1266,9 @@ function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnN
   graphLayout.className = "graph-layout";
   const graphHost = document.createElement("div");
   graphHost.className = "graph-host";
-  if (focusId && graphResult) {
+  if (focusId !== undefined && graphResult) {
     graphHost.append(renderGraphSvg(graphResult, focusId, state.selectedTurn, (nodeId) => {
-      focusGraphOnNode(graphResult.nodes.find((node) => node.id === nodeId));
-      rerender();
+      void focusGraphOnNode(graphResult.nodes.find((node) => node.id === nodeId));
     }));
   }
 
@@ -1185,9 +1312,9 @@ function renderGraphFocusHand(editor: EditorState, node: SearchNode, onResetFocu
 
 function renderGraphSvg(
   result: CalculationResult,
-  rootId: string,
+  rootId: NodeId,
   turn: number,
-  onSelect: (nodeId: string) => void
+  onSelect: (nodeId: NodeId) => void
 ): HTMLElement {
   const graph = buildFocusedGraphLayout(result, rootId, turn);
   const width = Math.max(920, graph.width);
@@ -1203,7 +1330,7 @@ function renderGraphSvg(
     line.setAttribute("y1", String(edge.y1));
     line.setAttribute("x2", String(edge.x2));
     line.setAttribute("y2", String(edge.y2));
-    line.setAttribute("stroke", edge.kind === "chance" ? "#0f6a54" : "#a64b00");
+    line.setAttribute("stroke", edge.kind === EdgeKind.Chance ? "#0f6a54" : "#a64b00");
     line.setAttribute("stroke-width", "2");
     line.setAttribute("opacity", "0.55");
     svg.append(line);
@@ -1260,7 +1387,7 @@ function renderGraphSvg(
       group.append(line);
     });
 
-    if (item.nodeId) {
+    if (item.nodeId !== undefined) {
       group.addEventListener("click", () => onSelect(item.nodeId!));
     }
     svg.append(group);
@@ -1290,7 +1417,7 @@ function renderGraphSvg(
         tile.setAttribute("y", "0");
         tile.setAttribute("class", "svg-tile-small");
         tile.textContent = tileLigature(row.tile);
-        if (row.nodeId) {
+        if (row.nodeId !== undefined) {
           tileGroup.setAttribute("style", "cursor: pointer;");
           tile.setAttribute("style", "pointer-events: auto; cursor: pointer;");
           tileGroup.addEventListener("click", () => onSelect(row.nodeId!));
@@ -1351,7 +1478,7 @@ function renderNodeDetailPanel(editor: EditorState, nodes: SearchNode[], node: S
   const summary = document.createElement("div");
   summary.className = "stats-grid compact-grid";
   summary.innerHTML = `
-    <div class="stat-tile"><span class="stat-label">Phase</span><span class="stat-value">${node.phase}</span></div>
+    <div class="stat-tile"><span class="stat-label">Phase</span><span class="stat-value">${nodePhaseLabel(node.phase)}</span></div>
     <div class="stat-tile"><span class="stat-label">Shanten</span><span class="stat-value">${node.shanten}</span></div>
     <div class="stat-tile"><span class="stat-label">Riichi</span><span class="stat-value">${node.riichi ? "Yes" : "No"}</span></div>
     <div class="stat-tile"><span class="stat-label">EV @ t${turn}</span><span class="stat-value">${formatNumber(node.expScore[turn] ?? 0)}</span></div>
@@ -1681,7 +1808,7 @@ function meldTypeLabel(type: number): string {
   }
 }
 
-function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn: number) {
+function buildFocusedGraphLayout(result: CalculationResult, rootId: NodeId, turn: number) {
   const nodeMap = new Map(result.nodes.map((node) => [node.id, node]));
   const root = nodeMap.get(rootId);
   if (!root) {
@@ -1699,9 +1826,13 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
   const childRows = rootChildren.map((child) => {
     const childTurn = child.kind === "node" && child.node
       ? transitionTurn(root.phase, child.node.phase, turn, graphTurnMax)
+      : child.kind === "draw-outcome" && child.targetNode
+        ? transitionTurn(root.phase, child.targetNode.phase, turn, graphTurnMax)
       : turn;
     const optionList = child.kind === "node" && child.node
       ? optionListForNode(child.node, childTurn, nodeMap)
+      : child.kind === "draw-outcome" && child.targetNode
+        ? optionListForNode(child.targetNode, childTurn, nodeMap)
       : child.kind === "aggregate"
         ? child.optionList
         : undefined;
@@ -1729,13 +1860,13 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
     branchTile?: number;
     contentX: number;
     lineStartY: number;
-    nodeId?: string;
+    nodeId?: NodeId;
     action?: string;
   }> = [
     graphCardFromNode(root, turn, 1, rootX, rootY, true)
   ];
-  const edges: Array<{ x1: number; y1: number; x2: number; y2: number; kind: "chance" | "decision"; tile: number }> = [];
-  const optionLists: Array<{ x: number; y: number; kind: "chance" | "decision"; title: string; rows: GraphOptionRow[]; compact?: boolean }> = [];
+  const edges: Array<{ x1: number; y1: number; x2: number; y2: number; kind: EdgeKind; tile: number }> = [];
+  const optionLists: Array<{ x: number; y: number; kind: EdgeKind; title: string; rows: GraphOptionRow[]; compact?: boolean }> = [];
 
   let maxOptionListColumns = 3;
 
@@ -1744,10 +1875,12 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
     const childY = currentY;
     if (child.kind === "node" && child.node) {
       cards.push(
-        graphCardFromNode(child.node, turn, child.probability, childX, childY, false, `${child.edgeKind === "chance" ? "Draw" : "Discard"} ${tileName(child.tile)}`)
+        graphCardFromNode(child.node, childTurn, child.probability, childX, childY, false, `${edgeKindActionLabel(child.edgeKind)} ${tileName(child.tile)}`)
       );
+    } else if (child.kind === "draw-outcome") {
+      cards.push(graphDrawOutcomeCard(child, childX, childY));
     } else if (child.kind === "agari") {
-      cards.push(graphAgariCard(child, childX, childY, `${child.edgeKind === "chance" ? "Draw" : "Discard"} ${tileName(child.tile)}`));
+      cards.push(graphAgariCard(child, childX, childY, `${edgeKindActionLabel(child.edgeKind)} ${tileName(child.tile)}`));
     } else if (child.kind === "aggregate") {
       cards.push(graphAggregateCard(child, childX, childY));
     }
@@ -1812,13 +1945,13 @@ function graphCardFromNode(
     y,
     width: GRAPH_NODE_WIDTH,
     height: GRAPH_NODE_HEIGHT,
-    fill: node.phase === "draw" ? "#e8f5ef" : "#fff0dd",
+    fill: node.phase === NodePhase.Draw ? "#e8f5ef" : "#fff0dd",
     stroke: isRoot ? "#111111" : "#bda983",
     strokeWidth: isRoot ? "2.4" : "1.4",
-    title: isRoot ? `${node.phase === "draw" ? "Draw" : "Discard"} node${isRiichi ? " · Riichi" : ""}` : effectiveChildTitle,
+    title: isRoot ? `${nodePhaseLabel(node.phase)} node${isRiichi ? " · Riichi" : ""}` : effectiveChildTitle,
     lines,
     branchTile: isRoot ? undefined : parseBranchTile(branchLabel),
-    action: `${node.phase === "draw" ? "Discard" : "Draw"}`,
+    action: node.phase === NodePhase.Draw ? "Discard" : "Draw",
     contentX,
     lineStartY: isRoot || hasChildTitle ? 38 : 22,
     nodeId: node.id
@@ -1832,7 +1965,7 @@ function graphAgariCard(
     immediateScore: number;
     baseScore: number;
     uradoraHitProbability: number;
-    edgeKind: "chance" | "decision";
+    edgeKind: EdgeKind;
     evContribution: number;
     aggregate?: boolean;
   },
@@ -1870,6 +2003,48 @@ function graphAgariCard(
   };
 }
 
+function graphDrawOutcomeCard(
+  child: Extract<FocusedGraphChild, { kind: "draw-outcome" }>,
+  x: number,
+  y: number
+) {
+  const title = child.outcome === TileOutcome.Win
+    ? "Agari"
+    : child.outcome === TileOutcome.Mixed
+      ? "Win / hand change"
+      : "Hand change";
+  const valueLines = child.outcome === TileOutcome.Win
+    ? [
+        { text: `Base value ${formatInteger(child.averageBaseValue)}` },
+        { text: `Value ${formatNumber(child.averageValue)}` },
+        ...(child.averageUradoraHitProbability > 0 ? [{ text: `Uradora hit ${formatPercent(child.averageUradoraHitProbability)}` }] : [])
+      ]
+    : [
+        { text: `Avg value ${formatNumber(child.averageValue)}` },
+        ...(child.winProbability > 0 ? [{ text: `Win ${formatPercent(child.winProbability)}` }] : [])
+      ];
+  return {
+    x,
+    y,
+    width: GRAPH_NODE_WIDTH,
+    height: GRAPH_NODE_HEIGHT,
+    fill: child.outcome === TileOutcome.Win ? "#eef6ff" : "#e8f5ef",
+    stroke: "#bda983",
+    strokeWidth: "1.4",
+    title,
+    lines: [
+      { text: `Prob ${formatPercent(child.probability)}` },
+      { text: `EV contrib ${formatNumber(child.evContribution)}`, emphasis: true },
+      ...valueLines
+    ],
+    branchTile: child.tile,
+    contentX: 62,
+    lineStartY: 32,
+    nodeId: child.targetNode?.id,
+    action: "Draw"
+  };
+}
+
 function graphAggregateCard(
   child: Extract<FocusedGraphChild, { kind: "aggregate" }>,
   x: number,
@@ -1883,13 +2058,18 @@ function graphAggregateCard(
     fill: "#f5f5f2",
     stroke: "#bda983",
     strokeWidth: "1.4",
-    title: "Tsumogiri",
+    title: "Residual",
     lines: [
       { text: `Prob ${formatPercent(child.probability)}` },
-      { text: `EV ${formatNumber(child.averageExpScore)}`, emphasis: true },
-      { text: `Win ${formatPercent(child.averageWin)}` },
-      { text: `Tenpai ${formatPercent(child.averageTenpai)}` },
-      { text: `${child.branchCount} draws` }
+      {
+        text: child.evContribution !== undefined
+          ? `EV contrib ${formatNumber(child.evContribution)}`
+          : `EV ${formatNumber(child.averageExpScore)}`,
+        emphasis: true
+      },
+      // { text: `Win ${formatPercent(child.averageWin)}` },
+      // { text: `Tenpai ${formatPercent(child.averageTenpai)}` },
+      // { text: `${child.branchCount} draws` }
     ],
     contentX: 12,
     lineStartY: 36
@@ -1910,13 +2090,63 @@ function graphOptionListColumnCount(optionList: GraphOptionList): number {
   return Math.ceil(optionList.rows.length / GRAPH_OPTION_ROWS);
 }
 
-function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<string, SearchNode>) {
+function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<NodeId, SearchNode>) {
   const breakdown = root.turnBreakdowns.find((item) => item.turn === turn);
   if (!breakdown) {
     return [];
   }
-  if (root.phase === "draw") {
-    const chanceBranches = breakdown.chanceBranches ?? [];
+  if (root.phase === NodePhase.Draw) {
+    const graphTurnMax = Math.max(0, root.expScore.length - 1);
+    const chanceBranches = (breakdown.chanceBranches ?? [])
+      .filter((branch) => {
+        if (branch.immediateScore > 0) {
+          return true;
+        }
+        const target = nodeMap.get(branch.targetNodeId);
+        return target ? hasDisplayableGraphContinuation(target, transitionTurn(root.phase, target.phase, turn, graphTurnMax), nodeMap) : false;
+      });
+    const tsumogiriBranches = root.allowTegawari
+      ? chanceBranches.filter((branch) => branch.immediateScore <= 0 && isPreferredTsumogiriBranch(root, branch, turn, nodeMap))
+      : [];
+    const tsumogiriBranchKeys = new Set(tsumogiriBranches.map((branch) => `${branch.targetNodeId}:${branch.tile}`));
+
+    if (breakdown.tileBreakdowns) {
+      const tileBreakdownMap = new Map(breakdown.tileBreakdowns.map((entry) => [entry.tile, entry]));
+      const immediateDisplayBranches = chanceBranches
+        .filter((branch) => branch.immediateScore > 0 || !tsumogiriBranchKeys.has(`${branch.targetNodeId}:${branch.tile}`))
+        .reduce((branches, branch) => {
+          if (!branches.some((item) => item.tile === branch.tile)) {
+            branches.push(branch);
+          }
+          return branches;
+        }, [] as EdgeTurnBreakdown[]);
+      const outcomeChildren = immediateDisplayBranches
+        .map((branch) => {
+          const aggregate = tileBreakdownMap.get(branch.tile);
+          return aggregate
+            ? aggregateDrawOutcomeChild(aggregate, branch, nodeMap)
+            : immediateDrawOutcomeChild(root, branch, turn, graphTurnMax, nodeMap);
+        })
+        .filter((child): child is Extract<FocusedGraphChild, { kind: "draw-outcome" }> => Boolean(child))
+        .sort((left, right) => right.evContribution - left.evContribution || right.probability - left.probability || left.tile - right.tile);
+      const accountedEvContribution = outcomeChildren.reduce((sum, child) => sum + child.evContribution, 0);
+      const accountedProbability = outcomeChildren.reduce((sum, child) => sum + child.probability, 0);
+      const totalEvContribution = root.expScore[turn] ?? breakdown.tileBreakdowns.reduce((sum, entry) => sum + entry.evContribution, 0);
+      const tsumogiriAggregate = aggregateTsumogiriBox(
+        root,
+        breakdown,
+        turn,
+        chanceBranches,
+        tsumogiriBranches,
+        Math.max(0, totalEvContribution - accountedEvContribution),
+        remainingDisplayProbability(accountedProbability)
+      );
+      return [
+        ...outcomeChildren,
+        ...(tsumogiriAggregate ? [tsumogiriAggregate] : [])
+      ];
+    }
+
     const sortedAgariBranches = chanceBranches
       .filter((branch) => branch.immediateScore > 0)
       .sort((left, right) => (right.probability * right.immediateScore) - (left.probability * left.immediateScore) || right.probability - left.probability)
@@ -1927,45 +2157,20 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
         immediateScore: branch.immediateScore,
         baseScore: branch.baseScore,
         uradoraHitProbability: branch.uradoraHitProbability,
-        edgeKind: "chance" as const,
+        edgeKind: EdgeKind.Chance,
         evContribution: branch.probability * branch.immediateScore
       }));
 
-    if (root.shanten === 0 && root.riichi) {
-      return (breakdown.winTileBreakdowns ?? []).map((entry) => ({
-        kind: "agari" as const,
-        tile: entry.tile,
-        probability: entry.winProbability,
-        immediateScore: entry.averageWinValue,
-        baseScore: entry.averageBaseValue,
-        uradoraHitProbability: entry.averageUradoraHitProbability,
-        edgeKind: "chance" as const,
-        evContribution: entry.evContribution,
-        aggregate: true
-      }));
-    }
-
-    const tsumogiriBranches = root.allowTegawari
-      ? chanceBranches.filter((branch) => branch.immediateScore <= 0 && isPreferredTsumogiriBranch(root, branch, turn, nodeMap))
-      : [];
-    const tsumogiriBranchKeys = new Set(tsumogiriBranches.map((branch) => `${branch.targetNodeId}:${branch.tile}`));
-    const tsumogiriAggregate = tsumogiriBranches.length > 1
-      ? aggregateTsumogiriBranches(tsumogiriBranches)
-      : undefined;
-    const residualTsumogiriAggregate = !root.allowTegawari && !root.riichi
-      ? aggregateResidualTsumogiri(root, breakdown, turn, chanceBranches)
-      : undefined;
-
     const sortedDecisionBranches = chanceBranches
-      .filter((branch) => !tsumogiriBranchKeys.has(`${branch.targetNodeId}:${branch.tile}`))
+      .filter((branch) => branch.immediateScore <= 0 && !tsumogiriBranchKeys.has(`${branch.targetNodeId}:${branch.tile}`))
       .map((branch) => ({
         kind: "node" as const,
         node: nodeMap.get(branch.targetNodeId),
         tile: branch.tile,
         probability: branch.probability,
         immediateScore: branch.immediateScore,
-        edgeKind: "chance" as const,
-        sortEv: nodeMap.get(branch.targetNodeId)?.expScore[turn] ?? branch.realizedExpScore,
+        edgeKind: EdgeKind.Chance,
+        sortEv: nodeMap.get(branch.targetNodeId)?.expScore[Math.min(graphTurnMax, turn + 1)] ?? branch.realizedExpScore,
         title: nodeMap.get(branch.targetNodeId)
           ? continuationTitle(root, nodeMap.get(branch.targetNodeId)!, Math.min(root.expScore.length - 1, turn + 1), nodeMap)
           : undefined
@@ -1976,17 +2181,28 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
         tile: number;
         probability: number;
         immediateScore: number;
-        edgeKind: "chance";
+        edgeKind: EdgeKind.Chance;
         sortEv: number;
         title: string | undefined;
       } => Boolean(branch.node))
       .sort((left, right) => right.sortEv - left.sortEv || right.probability - left.probability);
 
+    const displayedProbability = sortedAgariBranches.reduce((sum, child) => sum + child.probability, 0)
+      + sortedDecisionBranches.reduce((sum, child) => sum + child.probability, 0);
+    const tsumogiriAggregate = aggregateTsumogiriBox(
+      root,
+      breakdown,
+      turn,
+      chanceBranches,
+      tsumogiriBranches,
+      undefined,
+      remainingDisplayProbability(displayedProbability)
+    );
+
     return [
       ...sortedAgariBranches,
       ...sortedDecisionBranches,
-      ...(tsumogiriAggregate ? [tsumogiriAggregate] : []),
-      ...(residualTsumogiriAggregate ? [residualTsumogiriAggregate] : [])
+      ...(tsumogiriAggregate ? [tsumogiriAggregate] : [])
     ];
   }
 
@@ -1997,31 +2213,75 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
       tile: branch.tile,
       probability: 1,
       immediateScore: 0,
-      edgeKind: "decision" as const,
+      edgeKind: EdgeKind.Decision,
       sortEv: branch.expScore,
       title: undefined as string | undefined
     }))
+    .filter((branch) => branch.node ? hasDisplayableGraphContinuation(branch.node, turn, nodeMap) : false)
     .filter((branch): branch is {
       kind: "node";
       node: SearchNode;
       tile: number;
       probability: number;
       immediateScore: number;
-      edgeKind: "decision";
+      edgeKind: EdgeKind.Decision;
       sortEv: number;
       title: string | undefined;
     } => Boolean(branch.node))
     .sort((left, right) => right.sortEv - left.sortEv || left.tile - right.tile);
 }
 
+function hasDisplayableGraphContinuation(
+  node: SearchNode,
+  turn: number,
+  nodeMap: Map<NodeId, SearchNode>
+): boolean {
+  const maxTurn = Math.max(0, node.expScore.length - 1);
+  const effectiveTurn = Math.min(maxTurn, turn);
+  const breakdown = node.turnBreakdowns.find((item) => item.turn === effectiveTurn);
+  if (!breakdown) {
+    return false;
+  }
+
+  if (node.phase === NodePhase.Discard) {
+    return (breakdown.decisionBranches ?? []).length > 0;
+  }
+
+  if (effectiveTurn >= maxTurn) {
+    return true;
+  }
+  return (breakdown.chanceBranches ?? []).some((branch) => {
+    if (branch.immediateScore > 0) {
+      return true;
+    }
+    const target = nodeMap.get(branch.targetNodeId);
+    return target ? hasImmediateGraphBranch(target, transitionTurn(node.phase, target.phase, effectiveTurn, maxTurn), nodeMap) : false;
+  });
+}
+
+function hasImmediateGraphBranch(node: SearchNode, turn: number, nodeMap: Map<NodeId, SearchNode>): boolean {
+  const maxTurn = Math.max(0, node.expScore.length - 1);
+  const effectiveTurn = Math.min(maxTurn, turn);
+  const breakdown = node.turnBreakdowns.find((item) => item.turn === effectiveTurn);
+  if (!breakdown) {
+    return false;
+  }
+  if (node.phase === NodePhase.Discard) {
+    return (breakdown.decisionBranches ?? []).length > 0;
+  }
+  return effectiveTurn >= maxTurn || (breakdown.chanceBranches ?? []).some((branch) => (
+    branch.immediateScore > 0 || nodeMap.has(branch.targetNodeId)
+  ));
+}
+
 function isPreferredTsumogiriBranch(
   root: SearchNode,
   branch: EdgeTurnBreakdown,
   turn: number,
-  nodeMap: Map<string, SearchNode>
+  nodeMap: Map<NodeId, SearchNode>
 ): boolean {
   const target = nodeMap.get(branch.targetNodeId);
-  if (!target || target.phase !== "discard") {
+  if (!target || target.phase !== NodePhase.Discard) {
     return false;
   }
   const nextTurn = transitionTurn(root.phase, target.phase, turn, Math.max(0, root.expScore.length - 1));
@@ -2032,15 +2292,117 @@ function isPreferredTsumogiriBranch(
   return bestDecision?.tile === branch.tile;
 }
 
-function aggregateTsumogiriBranches(branches: EdgeTurnBreakdown[]): FocusedGraphChild {
-  const probability = branches.reduce((sum, branch) => sum + branch.probability, 0);
-  const weighted = <K extends "realizedExpScore" | "targetWin" | "targetTenpai">(key: K): number => {
+function immediateDrawOutcomeChild(
+  root: SearchNode,
+  branch: EdgeTurnBreakdown,
+  turn: number,
+  graphTurnMax: number,
+  nodeMap: Map<NodeId, SearchNode>
+): Extract<FocusedGraphChild, { kind: "draw-outcome" }> | undefined {
+  if (branch.immediateScore > 0) {
+    return {
+      kind: "draw-outcome",
+      tile: branch.tile,
+      probability: branch.probability,
+      evContribution: branch.probability * branch.immediateScore,
+      averageValue: branch.immediateScore,
+      winProbability: branch.probability,
+      averageBaseValue: branch.baseScore,
+      averageUradoraHitProbability: branch.uradoraHitProbability,
+      outcome: TileOutcome.Win,
+      edgeKind: EdgeKind.Chance
+    };
+  }
+
+  const target = nodeMap.get(branch.targetNodeId);
+  if (!target) {
+    return undefined;
+  }
+  const targetTurn = transitionTurn(root.phase, target.phase, turn, graphTurnMax);
+  return {
+    kind: "draw-outcome",
+    tile: branch.tile,
+    probability: branch.probability,
+    evContribution: branch.probability * branch.realizedExpScore,
+    averageValue: branch.realizedExpScore,
+    winProbability: branch.probability * (target.winProb[targetTurn] ?? 0),
+    averageBaseValue: 0,
+    averageUradoraHitProbability: 0,
+    outcome: TileOutcome.HandChange,
+    edgeKind: EdgeKind.Chance,
+    targetNode: target
+  };
+}
+
+function aggregateDrawOutcomeChild(
+  aggregate: TileBreakdown,
+  branch: EdgeTurnBreakdown,
+  nodeMap: Map<NodeId, SearchNode>
+): Extract<FocusedGraphChild, { kind: "draw-outcome" }> {
+  return {
+    kind: "draw-outcome",
+    tile: aggregate.tile,
+    probability: aggregate.probability,
+    evContribution: aggregate.evContribution,
+    averageValue: aggregate.averageValue,
+    winProbability: aggregate.winProbability,
+    averageBaseValue: aggregate.averageBaseValue,
+    averageUradoraHitProbability: aggregate.averageUradoraHitProbability,
+    outcome: aggregate.outcome,
+    edgeKind: EdgeKind.Chance,
+    targetNode: branch.immediateScore > 0 ? undefined : nodeMap.get(branch.targetNodeId)
+  };
+}
+
+function aggregateTsumogiriBox(
+  node: SearchNode,
+  breakdown: NonNullable<SearchNode["turnBreakdowns"][number]>,
+  turn: number,
+  explicitBranches: EdgeTurnBreakdown[],
+  tsumogiriBranches: EdgeTurnBreakdown[],
+  evContribution?: number,
+  displayProbability?: number
+): FocusedGraphChild | undefined {
+  const explicitWeight = explicitBranches.reduce((sum, branch) => sum + branch.weight, 0);
+  const probabilityDenominator = node.wall.slice(0, 34).reduce((sum, count) => sum + count, 0);
+  const residualWeight = !node.allowTegawari && !node.riichi
+    ? Math.max(0, probabilityDenominator - explicitWeight)
+    : 0;
+  const rawResidualProbability = probabilityDenominator > 0
+    ? residualWeight / probabilityDenominator
+    : 0;
+  const collapsedProbability = probabilityDenominator > 0
+    ? tsumogiriBranches.reduce((sum, branch) => sum + branch.weight / probabilityDenominator, 0)
+    : 0;
+  const probability = displayProbability ?? collapsedProbability + rawResidualProbability;
+  if (probability <= 0 && Math.abs(evContribution ?? 0) <= 1e-9) {
+    return undefined;
+  }
+  const residualProbability = displayProbability === undefined
+    ? rawResidualProbability
+    : Math.max(0, probability - collapsedProbability);
+
+  const weightedBranchValue = <K extends "realizedExpScore" | "targetWin" | "targetTenpai">(key: K): number => {
     if (probability <= 0) {
       return 0;
     }
-    return branches.reduce((sum, branch) => sum + branch.probability * branch[key], 0) / probability;
+    const branchTotal = tsumogiriBranches.reduce((sum, branch) => (
+      sum + (probabilityDenominator > 0 ? branch.weight / probabilityDenominator : 0) * branch[key]
+    ), 0);
+    const residualValue = key === "realizedExpScore"
+      ? node.expScore[turn + 1] ?? 0
+      : key === "targetWin"
+        ? node.winProb[turn + 1] ?? 0
+        : node.tenpaiProb[turn + 1] ?? 0;
+    return (branchTotal + residualProbability * residualValue) / probability;
   };
-  const rows = branches
+  const explicitTiles = new Set(explicitBranches.map((branch) => branch.tile));
+  const residualBranchCount = residualWeight > 0
+    ? node.wall.reduce((count, tileCount, tile) => (
+        tileCount > 0 && !explicitTiles.has(tile) ? count + 1 : count
+      ), 0)
+    : 0;
+  const rows = tsumogiriBranches
     .slice()
     .sort((left, right) => left.tile - right.tile)
     .map((branch) => ({
@@ -2050,57 +2412,37 @@ function aggregateTsumogiriBranches(branches: EdgeTurnBreakdown[]): FocusedGraph
 
   return {
     kind: "aggregate",
-    edgeKind: "chance",
+    edgeKind: EdgeKind.Chance,
     probability,
-    averageExpScore: weighted("realizedExpScore"),
-    averageWin: weighted("targetWin"),
-    averageTenpai: weighted("targetTenpai"),
-    branchCount: branches.length,
-    optionList: {
-      kind: "chance",
-      title: "Collapsed draws",
-      rows,
-      compact: true
-    }
+    evContribution,
+    averageExpScore: weightedBranchValue("realizedExpScore"),
+    averageWin: weightedBranchValue("targetWin"),
+    averageTenpai: weightedBranchValue("targetTenpai"),
+    branchCount: tsumogiriBranches.length + residualBranchCount,
+    optionList: rows.length > 0
+      ? {
+          kind: EdgeKind.Chance,
+          title: "Collapsed draws",
+          rows,
+          compact: true
+        }
+      : undefined
   };
 }
 
-function aggregateResidualTsumogiri(
-  node: SearchNode,
-  breakdown: NonNullable<SearchNode["turnBreakdowns"][number]>,
-  turn: number,
-  explicitBranches: EdgeTurnBreakdown[]
-): FocusedGraphChild | undefined {
-  if (turn + 1 >= node.expScore.length || breakdown.remainingWallTiles <= 0) {
-    return undefined;
+function remainingDisplayProbability(displayedProbability: number): number {
+  if (Math.abs(displayedProbability - 1) < 1e-9) {
+    return 0;
   }
-  const explicitWeight = explicitBranches.reduce((sum, branch) => sum + branch.weight, 0);
-  const residualWeight = breakdown.remainingWallTiles - explicitWeight;
-  if (residualWeight <= 0) {
-    return undefined;
-  }
-  const explicitTiles = new Set(explicitBranches.map((branch) => branch.tile));
-  const branchCount = node.wall.reduce((count, tileCount, tile) => (
-    tileCount > 0 && !explicitTiles.has(tile) ? count + 1 : count
-  ), 0);
-
-  return {
-    kind: "aggregate",
-    edgeKind: "chance",
-    probability: residualWeight / breakdown.remainingWallTiles,
-    averageExpScore: node.expScore[turn + 1] ?? 0,
-    averageWin: node.winProb[turn + 1] ?? 0,
-    averageTenpai: node.tenpaiProb[turn + 1] ?? 0,
-    branchCount
-  };
+  return Math.max(0, 1 - displayedProbability);
 }
 
-function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<string, SearchNode>): GraphOptionList | undefined {
+function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<NodeId, SearchNode>): GraphOptionList | undefined {
   const breakdown = node.turnBreakdowns.find((item) => item.turn === turn);
   if (!breakdown) {
     return undefined;
   }
-  if (node.phase === "discard") {
+  if (node.phase === NodePhase.Discard) {
     const rows = (breakdown.decisionBranches ?? [])
       .slice()
       .sort((left, right) => right.expScore - left.expScore)
@@ -2109,7 +2451,7 @@ function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<string, 
         tile: branch.tile,
         text: `EV ${formatNumber(branch.expScore)}`
       }));
-    return rows.length > 0 ? { kind: "decision" as const, title: "Top discards", rows } : undefined;
+    return rows.length > 0 ? { kind: EdgeKind.Decision, title: "Top discards", rows } : undefined;
   }
 
   const chanceBranches = breakdown.chanceBranches ?? [];
@@ -2121,23 +2463,31 @@ function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<string, 
         tile: branch.tile,
         text: `${formatPercent(branch.probability)} · ${formatNumber(branch.immediateScore)}`
       }));
-    return rows.length > 0 ? { kind: "chance" as const, title: "Agari", rows } : undefined;
+    return rows.length > 0 ? { kind: EdgeKind.Chance, title: "Agari", rows } : undefined;
   }
 
   const visibleChanceBranches = node.allowTegawari
-    ? chanceBranches.filter((branch) => !isPreferredTsumogiriBranch(node, branch, turn, nodeMap))
-    : chanceBranches;
+    ? chanceBranches.filter((branch) => {
+        const target = nodeMap.get(branch.targetNodeId);
+        return target
+          && hasDisplayableGraphContinuation(target, transitionTurn(node.phase, target.phase, turn, Math.max(0, node.expScore.length - 1)), nodeMap)
+          && !isPreferredTsumogiriBranch(node, branch, turn, nodeMap);
+      })
+    : chanceBranches.filter((branch) => {
+        const target = nodeMap.get(branch.targetNodeId);
+        return target ? hasDisplayableGraphContinuation(target, transitionTurn(node.phase, target.phase, turn, Math.max(0, node.expScore.length - 1)), nodeMap) : false;
+      });
   const rows = visibleChanceBranches
     .sort((left, right) => right.realizedExpScore - left.realizedExpScore || right.probability - left.probability)
     .map((branch) => ({
       tile: branch.tile,
       text: `${formatPercent(branch.probability)} · EV ${formatNumber(branch.realizedExpScore)}`
     }));
-  return rows.length > 0 ? { kind: "chance" as const, title: "Draws", rows } : undefined;
+  return rows.length > 0 ? { kind: EdgeKind.Chance, title: "Draws", rows } : undefined;
 }
 
-function continuationTitle(rootDrawNode: SearchNode, discardNode: SearchNode, turn: number, nodeMap: Map<string, SearchNode>): string | undefined {
-  if (rootDrawNode.phase !== "draw" || discardNode.phase !== "discard") {
+function continuationTitle(rootDrawNode: SearchNode, discardNode: SearchNode, turn: number, nodeMap: Map<NodeId, SearchNode>): string | undefined {
+  if (rootDrawNode.phase !== NodePhase.Draw || discardNode.phase !== NodePhase.Discard) {
     return undefined;
   }
   const breakdown = discardNode.turnBreakdowns.find((item) => item.turn === turn);
@@ -2160,11 +2510,19 @@ function nodeImmediateWinValue(node: SearchNode, turn: number): number {
   );
 }
 
-function transitionTurn(sourcePhase: "draw" | "discard", targetPhase: "draw" | "discard", turn: number, tMax: number): number {
-  if (sourcePhase === "draw" && targetPhase === "discard") {
+function transitionTurn(sourcePhase: NodePhase, targetPhase: NodePhase, turn: number, tMax: number): number {
+  if (sourcePhase === NodePhase.Draw && targetPhase === NodePhase.Discard) {
     return Math.min(tMax, turn + 1);
   }
   return turn;
+}
+
+function nodePhaseLabel(phase: NodePhase): string {
+  return phase === NodePhase.Draw ? "Draw" : "Discard";
+}
+
+function edgeKindActionLabel(kind: EdgeKind): string {
+  return kind === EdgeKind.Chance ? "Draw" : "Discard";
 }
 
 function parseBranchTile(branchLabel?: string): number | undefined {

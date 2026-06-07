@@ -1,9 +1,14 @@
 import { ScoreTitle, Tile, TO_DORA, TO_INDICATOR, WinFlag } from "./constants.js";
 import {
   CalculationResult,
+  CacheKey,
   Config,
   Count,
+  EdgeId,
+  EdgeKind,
   MahjongAnalysisEngine,
+  NodeId,
+  NodePhase,
   NodeTurnBreakdown,
   Player,
   Round,
@@ -11,7 +16,8 @@ import {
   SearchNode,
   SearchSummary,
   Stat,
-  WinTileBreakdown
+  TileBreakdown,
+  TileOutcome
 } from "./model.js";
 import {
   addTileToMask,
@@ -25,10 +31,12 @@ import {
 } from "./utils.js";
 
 type CountRed = Count;
+const COUNT_PACK_BITS = 111n;
+const COUNT_PACK_MASK = (1n << COUNT_PACK_BITS) - 1n;
 
 interface CacheState {
-  draw: Map<string, string>;
-  discard: Map<string, string>;
+  draw: Map<CacheKey, NodeId>;
+  discard: Map<CacheKey, NodeId>;
 }
 
 interface NodeBuildInfo {
@@ -53,22 +61,85 @@ interface ScoreBreakdown {
   uradoraHitProbability: number;
 }
 
-interface InternalWinTileAggregate {
-  winProbability: number;
+interface InternalDrawTileAggregate {
+  probability: number;
   evContribution: number;
+  valueContribution: number;
+  winProbability: number;
   baseContribution: number;
   uradoraContribution: number;
+  targetNodeId?: NodeId;
+  targetContribution: number;
+  hasHandChange: boolean;
+  hasWin: boolean;
+}
+
+interface InternalTileBreakdown {
+  tile: number;
+  probability: number;
+  evContribution: number;
+  averageValue: number;
+  winProbability: number;
+  averageBaseValue: number;
+  averageUradoraHitProbability: number;
+  outcome: TileOutcome;
+  targetNodeId?: NodeId;
+}
+
+interface InternalSearchNode {
+  id: NodeId;
+  phase: NodePhase;
+  stateKey: CacheKey;
+  wallSize: number;
+  forcedDiscardTile?: number;
+  shantenType: number;
+  shanten: number;
+  riichi: boolean;
+  originDistance: number;
+  allowTegawari: boolean;
+  allowShantenDown: boolean;
+  actionMask: bigint;
+  outgoingEdgeIds: EdgeId[];
+  incomingEdgeIds: EdgeId[];
+  tenpaiProb: Float64Array;
+  winProb: Float64Array;
+  expScore: Float64Array;
+}
+
+interface InternalSearchEdge {
+  id: EdgeId;
+  sourceId: NodeId;
+  targetId: NodeId;
+  tile: number;
+  weight: number;
+  score: number;
+  baseScore: number;
+  uradoraHitProbability: number;
+  isWait: boolean;
+  isDiscard: boolean;
+  edgeKind: EdgeKind;
+  riichiBefore: boolean;
+  riichiAfter: boolean;
+}
+
+interface CalculationSnapshotState {
+  config: Config;
+  stats: Stat[];
+  search: SearchSummary;
+  warnings: string[];
+  context: CalculationResult["context"];
 }
 
 export class ExpectedScoreCalculatorTs {
-  private readonly nodes = new Map<string, SearchNode>();
-  private readonly edges = new Map<string, SearchEdge>();
+  private readonly nodes: Array<InternalSearchNode | undefined> = [];
+  private readonly edges: Array<InternalSearchEdge | undefined> = [];
   private readonly warnings: string[] = [];
-  private readonly winTileAggregateCache = new Map<string, WinTileBreakdown[]>();
+  private readonly drawTileAggregateCache = new Map<number, InternalTileBreakdown[]>();
   private drawCacheHits = 0;
   private discardCacheHits = 0;
   private nodeCounter = 0;
   private edgeCounter = 0;
+  private lastSnapshotState?: CalculationSnapshotState;
 
   calc(
     configInput: Config,
@@ -78,14 +149,15 @@ export class ExpectedScoreCalculatorTs {
     wallInput?: Count,
     options: CalculationOptions = {}
   ): CalculationResult {
-    this.nodes.clear();
-    this.edges.clear();
+    this.nodes.length = 0;
+    this.edges.length = 0;
     this.warnings.length = 0;
-    this.winTileAggregateCache.clear();
+    this.drawTileAggregateCache.clear();
     this.drawCacheHits = 0;
     this.discardCacheHits = 0;
     this.nodeCounter = 0;
     this.edgeCounter = 0;
+    this.lastSnapshotState = undefined;
 
     const graphDepthLimit = Math.max(0, options.graphDepthLimit ?? 2);
     const config: Config = { ...configInput };
@@ -100,7 +172,7 @@ export class ExpectedScoreCalculatorTs {
         : this.createWall(round, playerInput, configInput.enableReddora);
 
     if (config.sum === 0) {
-      config.sum = wall.slice(0, 34).reduce((sum, count) => sum + count, 0);
+      config.sum = this.countBaseWallTiles(wall);
     }
 
     // config.enableRiichi = true;
@@ -120,28 +192,28 @@ export class ExpectedScoreCalculatorTs {
     const riichi = options.startNode?.riichi ?? (config.enableRiichi && isClosed(player) && shantenOrigin <= 0);
     const caches: CacheState = { draw: new Map(), discard: new Map() };
     const stats: Stat[] = [];
-    let rootNodeId: string | undefined;
-    let rootPhase: "draw" | "discard" | undefined;
+    let rootNodeId: NodeId | undefined;
+    let rootPhase: NodePhase | undefined;
 
     if (!engine.scoring) {
       this.pushWarning("No scoring engine was provided. EV values will stay at 0 until a TS scorer is plugged in.");
     }
 
-    if (options.startNode?.phase === "draw" || (!options.startNode && numTiles === 13)) {
+    if (options.startNode?.phase === NodePhase.Draw || (!options.startNode && numTiles === 13)) {
       rootNodeId = this.drawNode(config, round, player, engine, caches, handCounts, wallCounts, handOrigin, shantenOrigin, riichi);
-      rootPhase = "draw";
+      rootPhase = NodePhase.Draw;
       if (config.calcStats) {
         this.calcStats(config);
       }
       const rootId = caches.draw.get(this.createCacheKey(handCounts, wallCounts, riichi));
-      if (rootId) {
-        const root = this.nodes.get(rootId)!;
+      if (rootId !== undefined) {
+        const root = this.getNode(rootId)!;
         const necessary = this.getNecessaryTiles(config, player, wall, engine);
         stats.push({
           tile: Tile.Null,
-          tenpaiProb: root.tenpaiProb.slice(),
-          winProb: root.winProb.slice(),
-          expScore: root.expScore.slice(),
+          tenpaiProb: Array.from(root.tenpaiProb),
+          winProb: Array.from(root.winProb),
+          expScore: Array.from(root.expScore),
           necessaryTiles: necessary.necessaryTiles,
           shanten: necessary.shanten,
           drawNodeId: root.id
@@ -161,7 +233,7 @@ export class ExpectedScoreCalculatorTs {
         riichi,
         options.startNode?.forcedDiscardTile
       );
-      rootPhase = "discard";
+      rootPhase = NodePhase.Discard;
       if (config.calcStats) {
         this.calcStats(config);
       }
@@ -171,15 +243,15 @@ export class ExpectedScoreCalculatorTs {
           continue;
         }
         this.discard(player, handCounts, wallCounts, tile);
-          const nodeId = caches.draw.get(this.createCacheKey(handCounts, wallCounts, riichi));
-        if (nodeId) {
-          const node = this.nodes.get(nodeId)!;
+        const nodeId = caches.draw.get(this.createCacheKey(handCounts, wallCounts, riichi));
+        if (nodeId !== undefined) {
+          const node = this.getNode(nodeId)!;
           const necessary = this.getNecessaryTiles(config, player, wall, engine);
           stats.push({
             tile,
-            tenpaiProb: node.tenpaiProb.slice(),
-            winProb: node.winProb.slice(),
-            expScore: node.expScore.slice(),
+            tenpaiProb: Array.from(node.tenpaiProb),
+            winProb: Array.from(node.winProb),
+            expScore: Array.from(node.expScore),
             necessaryTiles: necessary.necessaryTiles,
             shanten: necessary.shanten,
             drawNodeId: node.id
@@ -190,31 +262,71 @@ export class ExpectedScoreCalculatorTs {
     }
 
     const search: SearchSummary = {
-      searchedVertices: this.nodes.size,
-      searchedEdges: this.edges.size,
-      drawNodes: Array.from(this.nodes.values()).filter((node) => node.phase === "draw").length,
-      discardNodes: Array.from(this.nodes.values()).filter((node) => node.phase === "discard").length,
+      searchedVertices: this.nodeCounter,
+      searchedEdges: this.edgeCounter,
+      drawNodes: this.allNodes().filter((node) => node.phase === NodePhase.Draw).length,
+      discardNodes: this.allNodes().filter((node) => node.phase === NodePhase.Discard).length,
       drawCacheHits: this.drawCacheHits,
       discardCacheHits: this.discardCacheHits
     };
-    const snapshot = rootNodeId && rootPhase
+    const context: CalculationResult["context"] = {
+      originHand: this.decodeForDisplay(handOrigin),
+      originShanten: shantenOrigin,
+      graphDepthLimit,
+      rootWallCount: this.countBaseWallTiles(wall)
+    };
+    this.lastSnapshotState = {
+      config: { ...config },
+      stats: this.cloneStats(stats),
+      search,
+      warnings: this.warnings.slice(),
+      context
+    };
+    const snapshot = rootNodeId !== undefined && rootPhase !== undefined
       ? this.createGraphSnapshot(config, rootNodeId, rootPhase, graphDepthLimit)
       : { nodes: [], edges: [] };
 
     return {
       stats,
-      searched: this.nodes.size,
+      searched: this.nodeCounter,
       search,
       nodes: snapshot.nodes,
       edges: snapshot.edges,
       warnings: this.warnings.slice(),
       rootNodeId,
       rootPhase,
+      context
+    };
+  }
+
+  snapshotFromNode(rootNodeId: NodeId, graphDepthLimit?: number): CalculationResult {
+    if (!this.lastSnapshotState) {
+      throw new Error("No calculated graph is available. Run analysis before requesting a graph snapshot.");
+    }
+    const root = this.getNode(rootNodeId);
+    if (!root) {
+      throw new Error(`Graph node is not available in the cached calculation: ${rootNodeId}`);
+    }
+
+    const depthLimit = Math.max(0, graphDepthLimit ?? this.lastSnapshotState.context.graphDepthLimit);
+    const snapshot = this.createGraphSnapshot(
+      this.lastSnapshotState.config,
+      root.id,
+      root.phase,
+      depthLimit
+    );
+    return {
+      stats: this.cloneStats(this.lastSnapshotState.stats),
+      searched: this.lastSnapshotState.search.searchedVertices,
+      search: { ...this.lastSnapshotState.search },
+      nodes: snapshot.nodes,
+      edges: snapshot.edges,
+      warnings: this.lastSnapshotState.warnings.slice(),
+      rootNodeId: root.id,
+      rootPhase: root.phase,
       context: {
-        originHand: this.decodeForDisplay(handOrigin),
-        originShanten: shantenOrigin,
-        graphDepthLimit,
-        rootWallCount: wall.slice(0, 34).reduce((sum, count) => sum + count, 0)
+        ...this.lastSnapshotState.context,
+        graphDepthLimit: depthLimit
       }
     };
   }
@@ -385,10 +497,10 @@ export class ExpectedScoreCalculatorTs {
     return { expectedScore: score, baseScore, uradoraHitProbability };
   }
 
-  private drawNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean): string {
+  private drawNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean): NodeId {
     const key = this.createCacheKey(handCounts, wallCounts, riichi);
     const cachedId = caches.draw.get(key);
-    if (cachedId) {
+    if (cachedId !== undefined) {
       this.drawCacheHits += 1;
       return cachedId;
     }
@@ -396,7 +508,7 @@ export class ExpectedScoreCalculatorTs {
     const analysis = engine.analyzeNecessary(player.hand, player.melds.length, config.shantenType);
     const waitMask = this.extendMaskWithRedFives(this.tilesToMask(analysis.tiles));
     const allowTegawari = !riichi && config.enableTegawari && this.distance(handCounts, handOrigin) + analysis.shanten < shantenOrigin + config.extra;
-    const node = this.addNode("draw", key, handCounts, wallCounts, {
+    const node = this.addNode(NodePhase.Draw, key, handCounts, wallCounts, {
       shantenType: analysis.shantenType,
       shanten: analysis.shanten,
       actionMask: waitMask,
@@ -440,8 +552,8 @@ export class ExpectedScoreCalculatorTs {
               true,
               tile
             );
-            const edgeId = this.findEdge(node.id, targetId, tile, "chance");
-            if (!edgeId) {
+            const edgeId = this.findEdge(node.id, targetId, tile, EdgeKind.Chance);
+            if (edgeId === undefined) {
               this.addEdge(
                 node.id,
                 targetId,
@@ -452,7 +564,7 @@ export class ExpectedScoreCalculatorTs {
                 scoreBreakdown.uradoraHitProbability,
                 true,
                 false,
-                "chance",
+                EdgeKind.Chance,
                 true,
                 true
               );
@@ -474,7 +586,7 @@ export class ExpectedScoreCalculatorTs {
       const weight = wallCounts[tile];
       this.draw(player, handCounts, wallCounts, tile);
       const callRiichi = config.enableRiichi && isClosed(player) && analysis.shanten === 1 && isWait ? true : riichi;
-      let targetId: string;
+      let targetId: NodeId;
       let scoreBreakdown: ScoreBreakdown;
       if (riichi && !(analysis.shanten === 0 && isWait)) {
         this.discard(player, handCounts, wallCounts, tile);
@@ -512,8 +624,8 @@ export class ExpectedScoreCalculatorTs {
       }
       this.discard(player, handCounts, wallCounts, tile);
 
-      const edgeId = this.findEdge(node.id, targetId, tile, "chance");
-      if (!edgeId) {
+      const edgeId = this.findEdge(node.id, targetId, tile, EdgeKind.Chance);
+      if (edgeId === undefined) {
         this.addEdge(
           node.id,
           targetId,
@@ -524,7 +636,7 @@ export class ExpectedScoreCalculatorTs {
           scoreBreakdown.uradoraHitProbability,
           isWait,
           false,
-          "chance",
+          EdgeKind.Chance,
           riichi,
           callRiichi
         );
@@ -534,10 +646,10 @@ export class ExpectedScoreCalculatorTs {
     return node.id;
   }
 
-  private discardNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean, forcedDiscardTile?: number): string {
+  private discardNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean, forcedDiscardTile?: number): NodeId {
     const key = this.createCacheKey(handCounts, wallCounts, riichi, forcedDiscardTile);
     const cachedId = caches.discard.get(key);
-    if (cachedId) {
+    if (cachedId !== undefined) {
       this.discardCacheHits += 1;
       return cachedId;
     }
@@ -545,7 +657,7 @@ export class ExpectedScoreCalculatorTs {
     const analysis = engine.analyzeUnnecessary(player.hand, player.melds.length, config.shantenType);
     const discardMask = this.extendMaskWithRedFives(this.tilesToMask(analysis.tiles));
     const allowShantenDown = config.enableShantenDown && this.distance(handCounts, handOrigin) + analysis.shanten < shantenOrigin + config.extra;
-    const node = this.addNode("discard", key, handCounts, wallCounts, {
+    const node = this.addNode(NodePhase.Discard, key, handCounts, wallCounts, {
       shantenType: analysis.shantenType,
       shanten: analysis.shanten,
       actionMask: discardMask,
@@ -560,6 +672,9 @@ export class ExpectedScoreCalculatorTs {
       if (riichi && forcedDiscardTile !== undefined && tile !== forcedDiscardTile) {
         continue;
       }
+      if (riichi && forcedDiscardTile === undefined && !isDiscard) {
+        continue;
+      }
       if (handCounts[tile] <= 0 || (!allowShantenDown && !isDiscard)) {
         continue;
       }
@@ -572,8 +687,8 @@ export class ExpectedScoreCalculatorTs {
         ? this.calcScore(config, round, player, engine, handCounts, wallCounts, analysis.shantenType, tile, riichi)
         : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
 
-      const edgeId = this.findEdge(sourceId, node.id, tile, "decision");
-      if (!edgeId) {
+      const edgeId = this.findEdge(sourceId, node.id, tile, EdgeKind.Decision);
+      if (edgeId === undefined) {
         this.addEdge(
           sourceId,
           node.id,
@@ -584,7 +699,7 @@ export class ExpectedScoreCalculatorTs {
           scoreBreakdown.uradoraHitProbability,
           false,
           isDiscard,
-          "decision",
+          EdgeKind.Decision,
           riichi,
           riichi
         );
@@ -595,8 +710,9 @@ export class ExpectedScoreCalculatorTs {
   }
 
   private calcStats(config: Config): void {
-    const drawNodes = Array.from(this.nodes.values()).filter((node) => node.phase === "draw");
-    const discardNodes = Array.from(this.nodes.values()).filter((node) => node.phase === "discard");
+    const allNodes = this.allNodes();
+    const drawNodes = allNodes.filter((node) => node.phase === NodePhase.Draw);
+    const discardNodes = allNodes.filter((node) => node.phase === NodePhase.Discard);
 
     for (let turn = config.tMax; turn >= config.tMin; turn -= 1) {
       if (turn < config.tMax) {
@@ -610,11 +726,11 @@ export class ExpectedScoreCalculatorTs {
           let expAccum = 0;
 
           for (const edgeId of node.outgoingEdgeIds) {
-            const edge = this.edges.get(edgeId)!;
-            if (edge.edgeKind !== "chance") {
+            const edge = this.getEdge(edgeId)!;
+            if (edge.edgeKind !== EdgeKind.Chance) {
               continue;
             }
-            const target = this.nodes.get(edge.targetId)!;
+            const target = this.getNode(edge.targetId)!;
             tenpaiAccum += edge.weight * (target.tenpaiProb[turn + 1] - previousTenpai);
             winAccum += edge.weight * (target.winProb[turn + 1] - previousWin);
             expAccum += edge.weight * (Math.max(edge.score, target.expScore[turn + 1]) - previousExpScore);
@@ -629,13 +745,10 @@ export class ExpectedScoreCalculatorTs {
       for (const node of discardNodes) {
         if (node.riichi && node.forcedDiscardTile !== undefined && node.shanten !== -1) {
           const sourceId = this.forcedSourceNodeId(node);
-          const source = sourceId ? this.nodes.get(sourceId) : undefined;
+          const source = sourceId !== undefined ? this.getNode(sourceId) : undefined;
           node.tenpaiProb[turn] = source?.tenpaiProb[turn] ?? 0;
           node.winProb[turn] = source?.winProb[turn] ?? 0;
           node.expScore[turn] = source?.expScore[turn] ?? 0;
-          if (turn === config.tMin) {
-            node.turnBreakdowns = [];
-          }
           continue;
         }
 
@@ -647,11 +760,11 @@ export class ExpectedScoreCalculatorTs {
         let bestExpScoreTile: number | undefined;
 
         for (const edgeId of node.incomingEdgeIds) {
-          const edge = this.edges.get(edgeId)!;
-          if (edge.edgeKind !== "decision") {
+          const edge = this.getEdge(edgeId)!;
+          if (edge.edgeKind !== EdgeKind.Decision) {
             continue;
           }
-          const source = this.nodes.get(edge.sourceId)!;
+          const source = this.getNode(edge.sourceId)!;
           if (source.tenpaiProb[turn] > bestTenpai) {
             bestTenpai = source.tenpaiProb[turn];
             bestTenpaiTile = edge.tile;
@@ -669,9 +782,6 @@ export class ExpectedScoreCalculatorTs {
         node.tenpaiProb[turn] = bestTenpai;
         node.winProb[turn] = bestWin;
         node.expScore[turn] = bestExpScore;
-        if (turn === config.tMin) {
-          node.turnBreakdowns = [];
-        }
       }
     }
   }
@@ -684,8 +794,100 @@ export class ExpectedScoreCalculatorTs {
     };
   }
 
-  private createCacheKey(hand: CountRed, wall: CountRed, riichi: boolean, forcedDiscardTile?: number): string {
-    return `${hand.join(",")}/${wall.join(",")}/${riichi ? 1 : 0}/${forcedDiscardTile ?? -1}`;
+  private createCacheKey(hand: CountRed, wall: CountRed, riichi: boolean, forcedDiscardTile?: number): CacheKey {
+    const handKey = this.packCounts(hand);
+    const wallKey = this.packCounts(wall);
+    const forced = BigInt((forcedDiscardTile ?? 63) & 63);
+    return this.asCacheKey(handKey | (wallKey << COUNT_PACK_BITS) | (BigInt(riichi ? 1 : 0) << (COUNT_PACK_BITS * 2n)) | (forced << (COUNT_PACK_BITS * 2n + 1n)));
+  }
+
+  private packCounts(counts: CountRed): CacheKey {
+    let packed = 0n;
+    for (let tile = 0; tile < 37; tile += 1) {
+      packed |= BigInt(counts[tile] & 7) << BigInt(tile * 3);
+    }
+    return this.asCacheKey(packed);
+  }
+
+  private unpackCounts(packed: CacheKey): Count {
+    const counts = Array.from({ length: 37 }, () => 0);
+    for (let tile = 0; tile < 37; tile += 1) {
+      counts[tile] = Number((packed >> BigInt(tile * 3)) & 7n);
+    }
+    return counts;
+  }
+
+  private unpackCountsForDisplay(packed: CacheKey): Count {
+    return this.decodeForDisplay(this.unpackCounts(packed));
+  }
+
+  private unpackHandFromStateKey(stateKey: CacheKey): Count {
+    return this.unpackCountsForDisplay(this.asCacheKey(stateKey & COUNT_PACK_MASK));
+  }
+
+  private unpackWallFromStateKey(stateKey: CacheKey): Count {
+    return this.unpackCountsForDisplay(this.asCacheKey((stateKey >> COUNT_PACK_BITS) & COUNT_PACK_MASK));
+  }
+
+  private countBaseWallTiles(wallCounts: Count): number {
+    let total = 0;
+    for (let tile = 0; tile < 34; tile += 1) {
+      total += wallCounts[tile];
+    }
+    return total;
+  }
+
+  private countEncodedWallTiles(wallCounts: CountRed): number {
+    let total = 0;
+    for (let tile = 0; tile < 37; tile += 1) {
+      total += wallCounts[tile];
+    }
+    return total;
+  }
+
+  private drawTileAggregateCacheKey(nodeId: NodeId, turn: number, config: Config): number {
+    return nodeId * (config.tMax + 1) + turn;
+  }
+
+  private asNodeId(value: number): NodeId {
+    return value as NodeId;
+  }
+
+  private asEdgeId(value: number): EdgeId {
+    return value as EdgeId;
+  }
+
+  private asCacheKey(value: bigint): CacheKey {
+    return value as CacheKey;
+  }
+
+  private getNode(id: NodeId): InternalSearchNode | undefined {
+    return this.nodes[id];
+  }
+
+  private getEdge(id: EdgeId): InternalSearchEdge | undefined {
+    return this.edges[id];
+  }
+
+  private cloneStats(stats: Stat[]): Stat[] {
+    return stats.map((stat) => ({
+      ...stat,
+      tenpaiProb: stat.tenpaiProb.slice(),
+      winProb: stat.winProb.slice(),
+      expScore: stat.expScore.slice(),
+      necessaryTiles: stat.necessaryTiles.map(([tile, count]) => [tile, count] as [number, number])
+    }));
+  }
+
+  private allNodes(): InternalSearchNode[] {
+    const nodes: InternalSearchNode[] = [];
+    for (let id = 1; id < this.nodes.length; id += 1) {
+      const node = this.nodes[this.asNodeId(id)];
+      if (node) {
+        nodes.push(node);
+      }
+    }
+    return nodes;
   }
 
   private tilesToMask(tiles: number[]): bigint {
@@ -710,21 +912,26 @@ export class ExpectedScoreCalculatorTs {
     return extended;
   }
 
-  private addNode(phase: "draw" | "discard", cacheKey: string, handCounts: CountRed, wallCounts: CountRed, info: NodeBuildInfo, riichi: boolean, config: Config, originDistance: number): SearchNode {
-    const id = `${phase[0]}${this.nodeCounter += 1}`;
-    const tenpaiProb = Array.from({ length: config.tMax + 1 }, () => phase === "discard" && info.shanten === 0 ? 1 : 0);
-    const winProb = Array.from({ length: config.tMax + 1 }, () => phase === "discard" && info.shanten === -1 ? 1 : 0);
-    const expScore = Array.from({ length: config.tMax + 1 }, () => 0);
-    if (phase === "draw") {
+  private addNode(phase: NodePhase, cacheKey: CacheKey, handCounts: CountRed, wallCounts: CountRed, info: NodeBuildInfo, riichi: boolean, config: Config, originDistance: number): InternalSearchNode {
+    const id = this.asNodeId(this.nodeCounter += 1);
+    const tenpaiProb = new Float64Array(config.tMax + 1);
+    const winProb = new Float64Array(config.tMax + 1);
+    const expScore = new Float64Array(config.tMax + 1);
+    if (phase === NodePhase.Discard && info.shanten === 0) {
+      tenpaiProb.fill(1);
+    }
+    if (phase === NodePhase.Discard && info.shanten === -1) {
+      winProb.fill(1);
+    }
+    if (phase === NodePhase.Draw) {
       tenpaiProb[config.tMax] = info.shanten === 0 ? 1 : 0;
     }
 
-    const node: SearchNode = {
+    const node: InternalSearchNode = {
       id,
       phase,
-      cacheKey,
-      hand: this.decodeForDisplay(handCounts),
-      wall: this.decodeForDisplay(wallCounts),
+      stateKey: cacheKey,
+      wallSize: this.countEncodedWallTiles(wallCounts),
       forcedDiscardTile: info.forcedDiscardTile,
       shantenType: info.shantenType,
       shanten: info.shanten,
@@ -737,16 +944,15 @@ export class ExpectedScoreCalculatorTs {
       incomingEdgeIds: [],
       tenpaiProb,
       winProb,
-      expScore,
-      turnBreakdowns: []
+      expScore
     };
-    this.nodes.set(id, node);
+    this.nodes[id] = node;
     return node;
   }
 
   private addEdge(
-    sourceId: string,
-    targetId: string,
+    sourceId: NodeId,
+    targetId: NodeId,
     tile: number,
     weight: number,
     score: number,
@@ -754,12 +960,12 @@ export class ExpectedScoreCalculatorTs {
     uradoraHitProbability: number,
     isWait: boolean,
     isDiscard: boolean,
-    edgeKind: "chance" | "decision",
+    edgeKind: EdgeKind,
     riichiBefore: boolean,
     riichiAfter: boolean
   ): void {
-    const id = `e${this.edgeCounter += 1}`;
-    const edge: SearchEdge = {
+    const id = this.asEdgeId(this.edgeCounter += 1);
+    const edge: InternalSearchEdge = {
       id,
       sourceId,
       targetId,
@@ -774,14 +980,14 @@ export class ExpectedScoreCalculatorTs {
       riichiBefore,
       riichiAfter
     };
-    this.edges.set(id, edge);
-    this.nodes.get(sourceId)!.outgoingEdgeIds.push(id);
-    this.nodes.get(targetId)!.incomingEdgeIds.push(id);
+    this.edges[id] = edge;
+    this.getNode(sourceId)!.outgoingEdgeIds.push(id);
+    this.getNode(targetId)!.incomingEdgeIds.push(id);
   }
 
-  private findEdge(sourceId: string, targetId: string, tile: number, edgeKind: "chance" | "decision"): string | undefined {
-    for (const edgeId of this.nodes.get(sourceId)?.outgoingEdgeIds ?? []) {
-      const edge = this.edges.get(edgeId);
+  private findEdge(sourceId: NodeId, targetId: NodeId, tile: number, edgeKind: EdgeKind): EdgeId | undefined {
+    for (const edgeId of this.getNode(sourceId)?.outgoingEdgeIds ?? []) {
+      const edge = this.getEdge(edgeId);
       if (edge && edge.targetId === targetId && edge.tile === tile && edge.edgeKind === edgeKind) {
         return edgeId;
       }
@@ -797,14 +1003,14 @@ export class ExpectedScoreCalculatorTs {
 
   private createGraphSnapshot(
     config: Config,
-    rootNodeId: string,
-    rootPhase: "draw" | "discard",
+    rootNodeId: NodeId,
+    rootPhase: NodePhase,
     depthLimit: number
   ): { nodes: SearchNode[]; edges: SearchEdge[] } {
-    const queue: Array<{ nodeId: string; depth: number }> = [{ nodeId: rootNodeId, depth: 0 }];
-    const visited = new Set<string>();
-    const nodeOrder: string[] = [];
-    const includedEdges = new Set<string>();
+    const queue: Array<{ nodeId: NodeId; depth: number }> = [{ nodeId: rootNodeId, depth: 0 }];
+    const visited = new Set<NodeId>();
+    const nodeOrder: NodeId[] = [];
+    const includedEdges = new Set<EdgeId>();
 
     while (queue.length > 0) {
       const current = queue.shift()!;
@@ -817,55 +1023,71 @@ export class ExpectedScoreCalculatorTs {
         continue;
       }
 
-      const node = this.nodes.get(current.nodeId);
+      const node = this.getNode(current.nodeId);
       if (!node) {
         continue;
       }
-      const branchEdgeIds = node.phase === "draw"
-        ? node.outgoingEdgeIds.filter((edgeId) => this.edges.get(edgeId)?.edgeKind === "chance")
-        : node.incomingEdgeIds.filter((edgeId) => this.edges.get(edgeId)?.edgeKind === "decision");
+      const branchEdgeIds = node.phase === NodePhase.Draw
+        ? node.outgoingEdgeIds.filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Chance)
+        : node.incomingEdgeIds.filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Decision);
       branchEdgeIds.forEach((edgeId) => {
-        const edge = this.edges.get(edgeId);
+        const edge = this.getEdge(edgeId);
         if (!edge) {
           return;
         }
         includedEdges.add(edgeId);
-        const nextId = node.phase === "draw" ? edge.targetId : edge.sourceId;
+        const nextId = node.phase === NodePhase.Draw ? edge.targetId : edge.sourceId;
         if (!visited.has(nextId)) {
           queue.push({ nodeId: nextId, depth: current.depth + 1 });
         }
       });
     }
 
-    const edges = Array.from(includedEdges)
-      .map((edgeId) => this.edges.get(edgeId))
-      .filter((edge): edge is SearchEdge => Boolean(edge))
-      .filter((edge) => visited.has(edge.sourceId) && visited.has(edge.targetId))
-      .map((edge) => ({ ...edge }));
+    const internalEdges = Array.from(includedEdges)
+      .map((edgeId) => this.getEdge(edgeId))
+      .filter((edge): edge is InternalSearchEdge => Boolean(edge))
+      .filter((edge) => visited.has(edge.sourceId) && visited.has(edge.targetId));
+    const edges = internalEdges.map((edge) => ({ ...edge }));
 
-    const includedEdgeIds = new Set(edges.map((edge) => edge.id));
+    const includedEdgeIds = new Set(internalEdges.map((edge) => edge.id));
     const nodes = nodeOrder
-      .map((nodeId) => this.nodes.get(nodeId))
-      .filter((node): node is SearchNode => Boolean(node))
-      .map((node) => ({
-        ...node,
-        hand: cloneCount(node.hand),
-        wall: cloneCount(node.wall),
-        outgoingEdgeIds: node.outgoingEdgeIds.filter((edgeId) => includedEdgeIds.has(edgeId)),
-        incomingEdgeIds: node.incomingEdgeIds.filter((edgeId) => includedEdgeIds.has(edgeId)),
-        tenpaiProb: node.tenpaiProb.slice(),
-        winProb: node.winProb.slice(),
-        expScore: node.expScore.slice(),
-        turnBreakdowns: this.buildTurnBreakdowns(node, config)
-      }));
+      .map((nodeId) => this.getNode(nodeId))
+      .filter((node): node is InternalSearchNode => Boolean(node))
+      .map((node) => {
+        const outgoingEdgeIds = node.outgoingEdgeIds
+          .filter((edgeId) => includedEdgeIds.has(edgeId));
+        const incomingEdgeIds = node.incomingEdgeIds
+          .filter((edgeId) => includedEdgeIds.has(edgeId));
+        return {
+          id: node.id,
+          phase: node.phase,
+          cacheKey: node.stateKey,
+          hand: this.unpackHandFromStateKey(node.stateKey),
+          wall: this.unpackWallFromStateKey(node.stateKey),
+          forcedDiscardTile: node.forcedDiscardTile,
+          shantenType: node.shantenType,
+          shanten: node.shanten,
+          riichi: node.riichi,
+          originDistance: node.originDistance,
+          allowTegawari: node.allowTegawari,
+          allowShantenDown: node.allowShantenDown,
+          actionMask: node.actionMask,
+          outgoingEdgeIds,
+          incomingEdgeIds,
+          tenpaiProb: Array.from(node.tenpaiProb),
+          winProb: Array.from(node.winProb),
+          expScore: Array.from(node.expScore),
+          turnBreakdowns: this.buildTurnBreakdowns(node, config)
+        };
+      });
 
     return { nodes, edges };
   }
 
-  private buildTurnBreakdowns(node: SearchNode, config: Config): NodeTurnBreakdown[] {
+  private buildTurnBreakdowns(node: InternalSearchNode, config: Config): NodeTurnBreakdown[] {
     const breakdowns: NodeTurnBreakdown[] = [];
 
-    if (node.phase === "draw") {
+    if (node.phase === NodePhase.Draw) {
       breakdowns.push({
         turn: config.tMax,
         remainingWallTiles: config.sum - config.tMax,
@@ -881,14 +1103,14 @@ export class ExpectedScoreCalculatorTs {
         const previousExpScore = node.expScore[turn + 1] ?? 0;
         const denominator = config.sum - turn;
         const chanceBranches = node.outgoingEdgeIds
-          .filter((edgeId) => this.edges.get(edgeId)?.edgeKind === "chance")
+          .filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Chance)
           .map((edgeId) => {
-            const edge = this.edges.get(edgeId)!;
-            const target = this.nodes.get(edge.targetId)!;
+            const edge = this.getEdge(edgeId)!;
+            const target = this.getNode(edge.targetId)!;
             const realizedExpScore = Math.max(edge.score, target.expScore[turn + 1] ?? 0);
             return {
               tile: edge.tile,
-              targetNodeId: edge.targetId,
+              targetNodeId: target.id,
               weight: edge.weight,
               probability: denominator > 0 ? edge.weight / denominator : 0,
               immediateScore: edge.score,
@@ -910,9 +1132,7 @@ export class ExpectedScoreCalculatorTs {
           win: node.winProb[turn] ?? 0,
           expScore: node.expScore[turn] ?? 0,
           chanceBranches,
-          winTileBreakdowns: node.riichi && node.shanten === 0
-            ? this.aggregateWinTiles(node.id, turn, config)
-            : undefined
+          tileBreakdowns: this.aggregateDrawTiles(node.id, turn, config)
         });
       }
 
@@ -927,10 +1147,10 @@ export class ExpectedScoreCalculatorTs {
       let bestWin = node.winProb[turn] ?? 0;
       let bestExpScore = node.expScore[turn] ?? 0;
       const decisionBranches = node.incomingEdgeIds
-        .filter((edgeId) => this.edges.get(edgeId)?.edgeKind === "decision")
+        .filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Decision)
         .map((edgeId) => {
-          const edge = this.edges.get(edgeId)!;
-          const source = this.nodes.get(edge.sourceId)!;
+          const edge = this.getEdge(edgeId)!;
+          const source = this.getNode(edge.sourceId)!;
           const tenpai = source.tenpaiProb[turn] ?? 0;
           const win = source.winProb[turn] ?? 0;
           const expScore = source.expScore[turn] ?? 0;
@@ -950,7 +1170,7 @@ export class ExpectedScoreCalculatorTs {
 
           return {
             tile: edge.tile,
-            sourceNodeId: edge.sourceId,
+            sourceNodeId: source.id,
             tenpai,
             win,
             expScore
@@ -973,142 +1193,249 @@ export class ExpectedScoreCalculatorTs {
     return breakdowns.sort((left, right) => left.turn - right.turn);
   }
 
-  private aggregateWinTiles(nodeId: string, turn: number, config: Config): WinTileBreakdown[] {
-    const cacheKey = `${nodeId}@${turn}`;
-    const cached = this.winTileAggregateCache.get(cacheKey);
+  private aggregateDrawTiles(nodeId: NodeId, turn: number, config: Config): TileBreakdown[] {
+    return this.aggregateDrawTilesInternal(nodeId, turn, config).map((entry) => ({ ...entry }));
+  }
+
+  private aggregateDrawTilesInternal(nodeId: NodeId, turn: number, config: Config): InternalTileBreakdown[] {
+    const cacheKey = this.drawTileAggregateCacheKey(nodeId, turn, config);
+    const cached = this.drawTileAggregateCache.get(cacheKey);
     if (cached) {
       return cached.map((entry) => ({ ...entry }));
     }
 
-    const node = this.nodes.get(nodeId);
-    if (!node || turn > config.tMax) {
+    const node = this.getNode(nodeId);
+    if (!node || node.phase !== NodePhase.Draw || turn >= config.tMax) {
       return [];
     }
 
-    let aggregates = new Map<number, InternalWinTileAggregate>();
-    if (node.phase === "discard") {
-      const sourceId = node.riichi && node.forcedDiscardTile !== undefined
-        ? this.forcedSourceNodeId(node)
-        : this.bestExpScoreSourceNodeId(node, turn);
-      aggregates = sourceId ? this.aggregateWinTilesMap(sourceId, turn, config) : new Map();
-    } else if (turn < config.tMax) {
-      const denominator = config.sum - turn;
-      let totalBranchWeight = 0;
-      for (const edgeId of node.outgoingEdgeIds) {
-        const edge = this.edges.get(edgeId);
-        if (!edge || edge.edgeKind !== "chance" || denominator <= 0) {
-          continue;
-        }
-        totalBranchWeight += edge.weight;
-        const probability = edge.weight / denominator;
-        if (edge.score > 0) {
-          this.addWinTileAggregate(aggregates, edge.tile, probability, probability * edge.score, probability * edge.baseScore, probability * edge.uradoraHitProbability);
-          continue;
-        }
-        const childAggregates = this.aggregateWinTilesMap(edge.targetId, turn + 1, config);
-        childAggregates.forEach((value, tile) => {
-          this.addWinTileAggregate(
-            aggregates,
-            tile,
-            probability * value.winProbability,
-            probability * value.evContribution,
-            probability * value.baseContribution,
-            probability * value.uradoraContribution
-          );
-        });
-      }
-      const residualWeight = denominator - totalBranchWeight;
-      if (residualWeight > 0) {
-        const residualAggregates = this.aggregateWinTilesMap(node.id, turn + 1, config);
-        const residualProbability = residualWeight / denominator;
-        residualAggregates.forEach((value, tile) => {
-          this.addWinTileAggregate(
-            aggregates,
-            tile,
-            residualProbability * value.winProbability,
-            residualProbability * value.evContribution,
-            residualProbability * value.baseContribution,
-            residualProbability * value.uradoraContribution
-          );
-        });
-      }
+    const denominator = config.sum - turn;
+    if (denominator <= 0) {
+      return [];
+    }
+    const probabilityDenominator = node.wallSize;
+    if (probabilityDenominator <= 0) {
+      return [];
     }
 
-    const result = Array.from(aggregates.entries())
+    const aggregates = new Map<number, InternalDrawTileAggregate>();
+    let totalBranchWeight = 0;
+    for (const edgeId of node.outgoingEdgeIds) {
+      const edge = this.getEdge(edgeId);
+      if (!edge || edge.edgeKind !== EdgeKind.Chance) {
+        continue;
+      }
+
+      totalBranchWeight += edge.weight;
+      const evProbability = edge.weight / denominator;
+      const eventProbability = edge.weight / probabilityDenominator;
+      const target = this.getNode(edge.targetId);
+      const targetTurn = Math.min(config.tMax, turn + 1);
+      if (edge.score > 0) {
+        const realizedValue = Math.max(edge.score, target?.expScore[targetTurn] ?? 0);
+        this.addDrawTileAggregate(
+          aggregates,
+          edge.tile,
+          eventProbability,
+          evProbability * realizedValue,
+          eventProbability * realizedValue,
+          eventProbability,
+          eventProbability * edge.baseScore,
+          eventProbability * edge.uradoraHitProbability,
+          undefined,
+          true
+        );
+        continue;
+      }
+
+      if (!target) {
+        continue;
+      }
+      const bestDecision = target.riichi && target.forcedDiscardTile !== undefined
+        ? this.decisionEdgeForSource(target, this.forcedSourceNodeId(target))
+        : this.bestExpScoreDecisionEdge(target, targetTurn);
+      const source = bestDecision ? this.getNode(bestDecision.sourceId) : undefined;
+      if (bestDecision?.tile === edge.tile && source) {
+        const childAggregates = this.aggregateDrawTilesMap(source.id, targetTurn, config);
+        childAggregates.forEach((value, tile) => {
+          this.addDrawTileAggregateFromValue(aggregates, tile, eventProbability, evProbability, value);
+        });
+        continue;
+      }
+
+      const value = Math.max(edge.score, target.expScore[targetTurn] ?? 0);
+      this.addDrawTileAggregate(aggregates, edge.tile, eventProbability, evProbability * value, eventProbability * value, 0, 0, 0, target.id, false);
+    }
+
+    const residualWeight = denominator - totalBranchWeight;
+    if (Math.abs(residualWeight) > 1e-9) {
+      const residualEvProbability = residualWeight / denominator;
+      const residualEventWeight = Math.max(0, probabilityDenominator - totalBranchWeight);
+      const residualEventProbability = residualEventWeight / probabilityDenominator;
+      const residualAggregates = this.aggregateDrawTilesMap(node.id, turn + 1, config);
+      residualAggregates.forEach((value, tile) => {
+        this.addDrawTileAggregateFromValue(aggregates, tile, residualEventProbability, residualEvProbability, value);
+      });
+    }
+
+    const result: InternalTileBreakdown[] = Array.from(aggregates.entries())
       .map(([tile, value]) => ({
         tile,
-        winProbability: value.winProbability,
+        probability: value.probability,
         evContribution: value.evContribution,
-        averageWinValue: value.winProbability > 0 ? value.evContribution / value.winProbability : 0,
+        averageValue: value.probability > 0 ? value.valueContribution / value.probability : 0,
+        winProbability: value.winProbability,
         averageBaseValue: value.winProbability > 0 ? value.baseContribution / value.winProbability : 0,
-        averageUradoraHitProbability: value.winProbability > 0 ? value.uradoraContribution / value.winProbability : 0
+        averageUradoraHitProbability: value.winProbability > 0 ? value.uradoraContribution / value.winProbability : 0,
+        outcome: value.hasWin && value.hasHandChange
+          ? TileOutcome.Mixed
+          : value.hasWin
+            ? TileOutcome.Win
+            : TileOutcome.HandChange,
+        targetNodeId: value.targetNodeId
       }))
-      .sort((left, right) => right.evContribution - left.evContribution || right.winProbability - left.winProbability || left.tile - right.tile);
+      .sort((left, right) => right.evContribution - left.evContribution || right.probability - left.probability || left.tile - right.tile);
 
-    this.winTileAggregateCache.set(cacheKey, result);
+    this.drawTileAggregateCache.set(cacheKey, result);
     return result.map((entry) => ({ ...entry }));
   }
 
-  private aggregateWinTilesMap(nodeId: string, turn: number, config: Config): Map<number, InternalWinTileAggregate> {
-    const result = this.aggregateWinTiles(nodeId, turn, config);
-    return new Map(result.map((entry) => [entry.tile, {
-      winProbability: entry.winProbability,
-      evContribution: entry.evContribution,
-      baseContribution: entry.averageBaseValue * entry.winProbability,
-      uradoraContribution: entry.averageUradoraHitProbability * entry.winProbability
-    }]));
+  private aggregateDrawTilesMap(nodeId: NodeId, turn: number, config: Config): Map<number, InternalDrawTileAggregate> {
+    const result = this.aggregateDrawTilesInternal(nodeId, turn, config);
+    const mapped = new Map<number, InternalDrawTileAggregate>();
+    for (const entry of result) {
+      mapped.set(entry.tile, {
+        probability: entry.probability,
+        evContribution: entry.evContribution,
+        valueContribution: entry.averageValue * entry.probability,
+        winProbability: entry.winProbability,
+        baseContribution: entry.averageBaseValue * entry.winProbability,
+        uradoraContribution: entry.averageUradoraHitProbability * entry.winProbability,
+        targetNodeId: entry.targetNodeId,
+        targetContribution: entry.evContribution,
+      hasHandChange: entry.outcome === TileOutcome.HandChange || entry.outcome === TileOutcome.Mixed,
+      hasWin: entry.outcome === TileOutcome.Win || entry.outcome === TileOutcome.Mixed
+      });
+    }
+    return mapped;
   }
 
-  private bestExpScoreSourceNodeId(node: SearchNode, turn: number): string | undefined {
-    let bestSourceId: string | undefined;
+  private addDrawTileAggregate(
+    aggregates: Map<number, InternalDrawTileAggregate>,
+    tile: number,
+    probability: number,
+    evContribution: number,
+    valueContribution: number,
+    winProbability: number,
+    baseContribution: number,
+    uradoraContribution: number,
+    targetNodeId: NodeId | undefined,
+    isWin: boolean
+  ): void {
+    const current = aggregates.get(tile) ?? {
+      probability: 0,
+      evContribution: 0,
+      valueContribution: 0,
+      winProbability: 0,
+      baseContribution: 0,
+      uradoraContribution: 0,
+      targetNodeId: undefined,
+      targetContribution: -Infinity,
+      hasHandChange: false,
+      hasWin: false
+    };
+    current.probability += probability;
+    current.evContribution += evContribution;
+    current.valueContribution += valueContribution;
+    current.winProbability += winProbability;
+    current.baseContribution += baseContribution;
+    current.uradoraContribution += uradoraContribution;
+    current.hasWin ||= isWin;
+    current.hasHandChange ||= !isWin;
+    if (targetNodeId && evContribution > current.targetContribution) {
+      current.targetNodeId = targetNodeId;
+      current.targetContribution = evContribution;
+    }
+    aggregates.set(tile, current);
+  }
+
+  private addDrawTileAggregateFromValue(
+    aggregates: Map<number, InternalDrawTileAggregate>,
+    tile: number,
+    probabilityMultiplier: number,
+    evMultiplier: number,
+    value: InternalDrawTileAggregate
+  ): void {
+    const current = aggregates.get(tile) ?? {
+      probability: 0,
+      evContribution: 0,
+      valueContribution: 0,
+      winProbability: 0,
+      baseContribution: 0,
+      uradoraContribution: 0,
+      targetNodeId: undefined,
+      targetContribution: -Infinity,
+      hasHandChange: false,
+      hasWin: false
+    };
+    const evContribution = evMultiplier * value.evContribution;
+    current.probability += probabilityMultiplier * value.probability;
+    current.evContribution += evContribution;
+    current.valueContribution += probabilityMultiplier * value.valueContribution;
+    current.winProbability += probabilityMultiplier * value.winProbability;
+    current.baseContribution += probabilityMultiplier * value.baseContribution;
+    current.uradoraContribution += probabilityMultiplier * value.uradoraContribution;
+    current.hasWin ||= value.hasWin;
+    current.hasHandChange ||= value.hasHandChange;
+    if (value.targetNodeId && evContribution > current.targetContribution) {
+      current.targetNodeId = value.targetNodeId;
+      current.targetContribution = evContribution;
+    }
+    aggregates.set(tile, current);
+  }
+
+  private bestExpScoreDecisionEdge(node: InternalSearchNode, turn: number): InternalSearchEdge | undefined {
+    let bestEdge: InternalSearchEdge | undefined;
     let bestExpScore = -Infinity;
     for (const edgeId of node.incomingEdgeIds) {
-      const edge = this.edges.get(edgeId);
-      if (edge?.edgeKind !== "decision") {
+      const edge = this.getEdge(edgeId);
+      if (edge?.edgeKind !== EdgeKind.Decision) {
         continue;
       }
-      const source = edge ? this.nodes.get(edge.sourceId) : undefined;
+      const source = this.getNode(edge.sourceId);
       const expScore = source?.expScore[turn];
       if (expScore !== undefined && expScore > bestExpScore) {
         bestExpScore = expScore;
-        bestSourceId = source?.id;
+        bestEdge = edge;
       }
     }
-    return bestSourceId;
+    return bestEdge;
   }
 
-  private forcedSourceNodeId(node: SearchNode): string | undefined {
-    if (node.forcedDiscardTile === undefined) {
+  private decisionEdgeForSource(node: InternalSearchNode, sourceId: NodeId | undefined): InternalSearchEdge | undefined {
+    if (sourceId === undefined) {
       return undefined;
     }
     for (const edgeId of node.incomingEdgeIds) {
-      const edge = this.edges.get(edgeId);
-      if (edge?.edgeKind === "chance" && edge.tile === node.forcedDiscardTile) {
-        return edge.sourceId;
+      const edge = this.getEdge(edgeId);
+      if (edge?.edgeKind === EdgeKind.Decision && edge.sourceId === sourceId) {
+        return edge;
       }
     }
     return undefined;
   }
 
-  private addWinTileAggregate(
-    aggregates: Map<number, InternalWinTileAggregate>,
-    tile: number,
-    winProbability: number,
-    evContribution: number,
-    baseContribution: number,
-    uradoraContribution: number
-  ): void {
-    const current = aggregates.get(tile) ?? {
-      winProbability: 0,
-      evContribution: 0,
-      baseContribution: 0,
-      uradoraContribution: 0
-    };
-    current.winProbability += winProbability;
-    current.evContribution += evContribution;
-    current.baseContribution += baseContribution;
-    current.uradoraContribution += uradoraContribution;
-    aggregates.set(tile, current);
+  private forcedSourceNodeId(node: InternalSearchNode): NodeId | undefined {
+    if (node.forcedDiscardTile === undefined) {
+      return undefined;
+    }
+    for (const edgeId of node.incomingEdgeIds) {
+      const edge = this.getEdge(edgeId);
+      if (edge?.edgeKind === EdgeKind.Chance && edge.tile === node.forcedDiscardTile) {
+        return edge.sourceId;
+      }
+    }
+    return undefined;
   }
 
   private exactUradoraDistribution(wall: Count, handAndMelds: Count, wallSize: number, numIndicators: number): Map<number, number> {

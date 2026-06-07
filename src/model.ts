@@ -85,14 +85,33 @@ export interface Stat {
   expScore: number[];
   necessaryTiles: Array<[number, number]>;
   shanten: number;
-  drawNodeId?: string;
+  drawNodeId?: NodeId;
 }
 
-export type NodePhase = "draw" | "discard";
+export type Brand<T, Name extends string> = T & { readonly __brand: Name };
+export type NodeId = Brand<number, "NodeId">;
+export type EdgeId = Brand<number, "EdgeId">;
+export type CacheKey = Brand<bigint, "CacheKey">;
+
+export const enum NodePhase {
+  Draw,
+  Discard
+}
+
+export const enum EdgeKind {
+  Chance,
+  Decision
+}
+
+export const enum TileOutcome {
+  HandChange,
+  Win,
+  Mixed
+}
 
 export interface EdgeTurnBreakdown {
   tile: number;
-  targetNodeId: string;
+  targetNodeId: NodeId;
   weight: number;
   probability: number;
   immediateScore: number;
@@ -109,19 +128,22 @@ export interface EdgeTurnBreakdown {
 
 export interface DecisionTurnBreakdown {
   tile: number;
-  sourceNodeId: string;
+  sourceNodeId: NodeId;
   tenpai: number;
   win: number;
   expScore: number;
 }
 
-export interface WinTileBreakdown {
+export interface TileBreakdown {
   tile: number;
-  winProbability: number;
+  probability: number;
   evContribution: number;
-  averageWinValue: number;
+  averageValue: number;
+  winProbability: number;
   averageBaseValue: number;
   averageUradoraHitProbability: number;
+  outcome: TileOutcome;
+  targetNodeId?: NodeId;
 }
 
 export interface NodeTurnBreakdown {
@@ -132,16 +154,16 @@ export interface NodeTurnBreakdown {
   expScore: number;
   chanceBranches?: EdgeTurnBreakdown[];
   decisionBranches?: DecisionTurnBreakdown[];
-  winTileBreakdowns?: WinTileBreakdown[];
+  tileBreakdowns?: TileBreakdown[];
   bestTenpaiTile?: number;
   bestWinTile?: number;
   bestExpScoreTile?: number;
 }
 
 export interface SearchNode {
-  id: string;
+  id: NodeId;
   phase: NodePhase;
-  cacheKey: string;
+  cacheKey: CacheKey;
   hand: Count;
   wall: Count;
   forcedDiscardTile?: number;
@@ -152,8 +174,8 @@ export interface SearchNode {
   allowTegawari: boolean;
   allowShantenDown: boolean;
   actionMask: bigint;
-  outgoingEdgeIds: string[];
-  incomingEdgeIds: string[];
+  outgoingEdgeIds: EdgeId[];
+  incomingEdgeIds: EdgeId[];
   tenpaiProb: number[];
   winProb: number[];
   expScore: number[];
@@ -161,9 +183,9 @@ export interface SearchNode {
 }
 
 export interface SearchEdge {
-  id: string;
-  sourceId: string;
-  targetId: string;
+  id: EdgeId;
+  sourceId: NodeId;
+  targetId: NodeId;
   tile: number;
   weight: number;
   score: number;
@@ -171,7 +193,7 @@ export interface SearchEdge {
   uradoraHitProbability: number;
   isWait: boolean;
   isDiscard: boolean;
-  edgeKind: "chance" | "decision";
+  edgeKind: EdgeKind;
   riichiBefore: boolean;
   riichiAfter: boolean;
 }
@@ -199,7 +221,7 @@ export interface CalculationResult {
   nodes: SearchNode[];
   edges: SearchEdge[];
   warnings: string[];
-  rootNodeId?: string;
+  rootNodeId?: NodeId;
   rootPhase?: NodePhase;
   context: CalculationContext;
 }
