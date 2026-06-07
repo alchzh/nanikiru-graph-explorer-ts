@@ -159,6 +159,7 @@ main {
 .toggle-chip input {
   position: absolute;
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
 }
 
