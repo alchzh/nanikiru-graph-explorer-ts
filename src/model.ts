@@ -115,6 +115,15 @@ export interface DecisionTurnBreakdown {
   expScore: number;
 }
 
+export interface WinTileBreakdown {
+  tile: number;
+  winProbability: number;
+  evContribution: number;
+  averageWinValue: number;
+  averageBaseValue: number;
+  averageUradoraHitProbability: number;
+}
+
 export interface NodeTurnBreakdown {
   turn: number;
   remainingWallTiles: number;
@@ -123,6 +132,7 @@ export interface NodeTurnBreakdown {
   expScore: number;
   chanceBranches?: EdgeTurnBreakdown[];
   decisionBranches?: DecisionTurnBreakdown[];
+  winTileBreakdowns?: WinTileBreakdown[];
   bestTenpaiTile?: number;
   bestWinTile?: number;
   bestExpScoreTile?: number;
@@ -134,6 +144,7 @@ export interface SearchNode {
   cacheKey: string;
   hand: Count;
   wall: Count;
+  forcedDiscardTile?: number;
   shantenType: number;
   shanten: number;
   riichi: boolean;
@@ -160,6 +171,7 @@ export interface SearchEdge {
   uradoraHitProbability: number;
   isWait: boolean;
   isDiscard: boolean;
+  edgeKind: "chance" | "decision";
   riichiBefore: boolean;
   riichiAfter: boolean;
 }

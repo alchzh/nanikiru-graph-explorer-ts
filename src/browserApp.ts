@@ -7,6 +7,7 @@ import {
   Count,
   createDefaultConfig,
   createDefaultRound,
+  EdgeTurnBreakdown,
   Player,
   SearchNode
 } from "./model.js";
@@ -76,7 +77,55 @@ const SECOND_DEPTH_BRANCH_LIMIT = 4;
 const GRAPH_NODE_WIDTH = 214;
 const GRAPH_NODE_HEIGHT = 116;
 const GRAPH_OPTION_WIDTH = 240;
-const GRAPH_OPTION_ROWS = 8;
+const GRAPH_OPTION_ROWS = 6;
+const GRAPH_COMPACT_OPTION_TILES_PER_ROW = 8;
+const GRAPH_COMPACT_OPTION_TILE_STEP = 28;
+
+interface GraphOptionRow {
+  tile: number;
+  text?: string;
+  nodeId?: string;
+}
+
+interface GraphOptionList {
+  kind: "chance" | "decision";
+  title: string;
+  rows: GraphOptionRow[];
+  compact?: boolean;
+}
+
+type FocusedGraphChild =
+  | {
+      kind: "node";
+      node: SearchNode;
+      tile: number;
+      probability: number;
+      immediateScore: number;
+      edgeKind: "chance" | "decision";
+      sortEv: number;
+      title: string | undefined;
+    }
+  | {
+      kind: "agari";
+      tile: number;
+      probability: number;
+      immediateScore: number;
+      baseScore: number;
+      uradoraHitProbability: number;
+      edgeKind: "chance" | "decision";
+      evContribution: number;
+      aggregate?: boolean;
+    }
+  | {
+      kind: "aggregate";
+      edgeKind: "chance";
+      probability: number;
+      averageExpScore: number;
+      averageWin: number;
+      averageTenpai: number;
+      branchCount: number;
+      optionList?: GraphOptionList;
+    };
 
 const SAMPLE_SCENARIO: ScenarioInput = {
   config: {
@@ -139,8 +188,8 @@ export function mountBrowserApp(root: HTMLElement): void {
     const currentRoot = currentGraph.rootNodeId
       ? currentGraph.nodes.find((candidate) => candidate.id === currentGraph.rootNodeId)
       : undefined;
-    if (currentRoot?.phase === "draw" && node.phase === "discard") {
-      state.selectedTurn = Math.min(state.editor.config.tMax, state.selectedTurn + 1);
+    if (currentRoot) {
+      state.selectedTurn = transitionTurn(currentRoot.phase, node.phase, state.selectedTurn, state.editor.config.tMax);
     }
     state.graphResult = undefined;
     const rootConfig = {
@@ -197,7 +246,10 @@ function renderControls(state: AppState, rerender: () => void, runAnalysis: () =
 
   const editor = document.createElement("div");
   editor.className = "pystyle-editor";
-  editor.innerHTML = "<h1>Riichi Mahjong Game Tree Explorer</h1> <p>Based on code from <a href=\"https://github.com/nekobean/mahjong-cpp\">麻雀何切るシミュレーター</a> by <a href=\"https://github.com/nekobean\">nekobean</a></p> <p>Copyright © 2026 alchzh. This site's source code is licensed under the <a href=\"https://www.gnu.org/licenses/gpl-3.0.en.html\">GNU General Public License v3.0</a>.</p>"
+  editor.innerHTML = `
+    <h1>Riichi Mahjong Game Tree Explorer</h1> <p>Based on code from <a href="https://github.com/nekobean/mahjong-cpp">麻雀何切るシミュレーター</a> by <a href="https://github.com/nekobean">nekobean</a>.</p>
+    <p>Copyright © 2026 alchzh. This site's source code is licensed under the <a href="https://www.gnu.org/licenses/gpl-3.0.en.html">GNU General Public License v3.0</a>.</p>
+  `;
 
   editor.append(
     renderPystyleControlRows(state, rerender),
@@ -254,7 +306,6 @@ function renderPystyleControlRows(state: AppState, rerender: () => void): HTMLEl
       }
     )),
     renderLabeledControl("Current turn", renderTurnSelect(state, rerender)),
-    renderControlNote("If only the turn changes, you can adjust it from the results view without recalculating."),
     renderToggleRow(state, rerender)
   );
 
@@ -304,18 +355,6 @@ function renderTurnSelect(state: AppState, rerender: () => void): HTMLElement {
   return select;
 }
 
-function renderControlNote(text: string): HTMLElement {
-  const row = document.createElement("div");
-  row.className = "editor-row note-row";
-  const spacer = document.createElement("div");
-  spacer.className = "editor-label";
-  const note = document.createElement("div");
-  note.className = "editor-note";
-  note.textContent = text;
-  row.append(spacer, note);
-  return row;
-}
-
 function renderToggleRow(state: AppState, rerender: () => void): HTMLElement {
   const row = document.createElement("div");
   row.className = "editor-row";
@@ -333,7 +372,11 @@ function renderToggleRow(state: AppState, rerender: () => void): HTMLElement {
       state.editor.config.enableUradora = checked;
       rerender();
     }),
-    createToggle("Shanten down", state.editor.config.enableShantenDown, (checked) => {
+    createToggle("Riichi", state.editor.config.enableRiichi, (checked) => {
+      state.editor.config.enableRiichi = checked;
+      rerender();
+    }),
+    createToggle("Shanten back", state.editor.config.enableShantenDown, (checked) => {
       state.editor.config.enableShantenDown = checked;
       rerender();
     }),
@@ -1181,9 +1224,19 @@ function renderGraphSvg(
     group.append(rect);
 
     if (item.branchTile !== undefined) {
+      if (item.action !== undefined) {
+        const action = document.createElementNS(svgNS, "text");
+        action.setAttribute("x", "33");
+        action.setAttribute("y", "20");
+        action.setAttribute("text-anchor", "middle")
+        action.setAttribute("class", "svg-sub");
+        action.textContent = item.action;
+        group.append(action);
+      }
+
       const tile = document.createElementNS(svgNS, "text");
-      tile.setAttribute("x", "15");
-      tile.setAttribute("y", "50");
+      tile.setAttribute("x", "20");
+      tile.setAttribute("y", "65");
       tile.setAttribute("class", "svg-card-tile");
       tile.textContent = tileLigature(item.branchTile);
       group.append(tile);
@@ -1219,35 +1272,67 @@ function renderGraphSvg(
 
     const title = document.createElementNS(svgNS, "text");
     title.setAttribute("x", "0");
-    title.setAttribute("y", "12");
+    title.setAttribute("y", "0");
     title.setAttribute("class", "svg-label");
     title.textContent = list.title;
     group.append(title);
 
-    const columnWidth = 180;
-    const rowHeight = 18;
-    const rowStartY = 34;
+    const rowStartY = 20;
 
-    list.rows.forEach((row, index) => {
-      const columnIndex = Math.floor(index / GRAPH_OPTION_ROWS);
-      const rowIndex = index % GRAPH_OPTION_ROWS;
-      const columnX = columnIndex * columnWidth;
-      const rowY = rowStartY + rowIndex * rowHeight;
+    if (list.compact) {
+      list.rows.forEach((row, index) => {
+        const columnIndex = index % GRAPH_COMPACT_OPTION_TILES_PER_ROW;
+        const rowIndex = Math.floor(index / GRAPH_COMPACT_OPTION_TILES_PER_ROW);
+        const tileGroup = document.createElementNS(svgNS, "g");
+        tileGroup.setAttribute("transform", `translate(${columnIndex * GRAPH_COMPACT_OPTION_TILE_STEP}, ${rowStartY + rowIndex * GRAPH_COMPACT_OPTION_TILE_STEP})`);
+        const tile = document.createElementNS(svgNS, "text");
+        tile.setAttribute("x", "0");
+        tile.setAttribute("y", "0");
+        tile.setAttribute("class", "svg-tile-small");
+        tile.textContent = tileLigature(row.tile);
+        if (row.nodeId) {
+          tileGroup.setAttribute("style", "cursor: pointer;");
+          tile.setAttribute("style", "pointer-events: auto; cursor: pointer;");
+          tileGroup.addEventListener("click", () => onSelect(row.nodeId!));
+          const hitArea = document.createElementNS(svgNS, "rect");
+          hitArea.setAttribute("x", "-2");
+          hitArea.setAttribute("y", "-20");
+          hitArea.setAttribute("width", "24");
+          hitArea.setAttribute("height", "24");
+          hitArea.setAttribute("fill", "transparent");
+          hitArea.setAttribute("pointer-events", "all");
+          const tooltip = document.createElementNS(svgNS, "title");
+          tooltip.textContent = `Explore draw ${tileName(row.tile)}`;
+          tileGroup.append(tooltip);
+          tileGroup.append(hitArea);
+        }
+        tileGroup.append(tile);
+        group.append(tileGroup);
+      });
+    } else {
+      const columnWidth = 180;
+      const rowHeight = 18;
+      list.rows.forEach((row, index) => {
+        const columnIndex = Math.floor(index / GRAPH_OPTION_ROWS);
+        const rowIndex = index % GRAPH_OPTION_ROWS;
+        const columnX = columnIndex * columnWidth;
+        const rowY = rowStartY + rowIndex * rowHeight;
 
-      const tile = document.createElementNS(svgNS, "text");
-      tile.setAttribute("x", String(columnX));
-      tile.setAttribute("y", String(rowY));
-      tile.setAttribute("class", "svg-tile-small");
-      tile.textContent = tileLigature(row.tile);
-      group.append(tile);
+        const tile = document.createElementNS(svgNS, "text");
+        tile.setAttribute("x", String(columnX));
+        tile.setAttribute("y", String(rowY));
+        tile.setAttribute("class", "svg-tile-small");
+        tile.textContent = tileLigature(row.tile);
+        group.append(tile);
 
-      const text = document.createElementNS(svgNS, "text");
-      text.setAttribute("x", String(columnX + 32));
-      text.setAttribute("y", String(rowY));
-      text.setAttribute("class", "svg-sub");
-      text.textContent = row.text;
-      group.append(text);
-    });
+        const text = document.createElementNS(svgNS, "text");
+        text.setAttribute("x", String(columnX + 20));
+        text.setAttribute("y", String(rowY - 2));
+        text.setAttribute("class", "svg-sub");
+        text.textContent = row.text ?? "";
+        group.append(text);
+      });
+    }
 
     svg.append(group);
   });
@@ -1509,8 +1594,19 @@ function normalizeTile(tile: string | number): number {
   return typeof tile === "number" ? tile : parseTile(tile);
 }
 
+function tileSortOrder(tile: Tile) {
+  switch (tile) {
+    case Tile.RedManzu5:
+    case Tile.RedPinzu5:
+    case Tile.RedSouzu5:
+      return makeRedFiveNormal(tile) - 0.5;
+    default:
+      return tile;
+  }
+}
+
 function sortTiles(tiles: number[]): number[] {
-  return tiles.slice().sort((left, right) => left - right);
+  return tiles.slice().sort((left, right) => tileSortOrder(left) - tileSortOrder(right));
 }
 
 function addTileToTarget(editor: EditorState, tile: number): void {
@@ -1593,6 +1689,7 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
   }
 
   const rootChildren = immediateGraphChildren(root, turn, nodeMap);
+  const graphTurnMax = Math.max(0, root.expScore.length - 1);
   const startY = 30;
   const rowGap = 14;
   const rootX = 30;
@@ -1600,10 +1697,18 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
   const optionX = childX + GRAPH_NODE_WIDTH + 22;
 
   const childRows = rootChildren.map((child) => {
-    const optionList = child.kind === "node" ? optionListForNode(child.node, turn) : undefined;
-    const optionHeight = optionList ? 26 + Math.min(optionList.rows.length, 8) * 18 : 0;
+    const childTurn = child.kind === "node" && child.node
+      ? transitionTurn(root.phase, child.node.phase, turn, graphTurnMax)
+      : turn;
+    const optionList = child.kind === "node" && child.node
+      ? optionListForNode(child.node, childTurn, nodeMap)
+      : child.kind === "aggregate"
+        ? child.optionList
+        : undefined;
+    const optionHeight = optionList ? graphOptionListHeight(optionList) : 0;
     return {
       child,
+      childTurn,
       optionList,
       height: Math.max(GRAPH_NODE_HEIGHT, optionHeight || 0)
     };
@@ -1625,16 +1730,17 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
     contentX: number;
     lineStartY: number;
     nodeId?: string;
+    action?: string;
   }> = [
     graphCardFromNode(root, turn, 1, rootX, rootY, true)
   ];
   const edges: Array<{ x1: number; y1: number; x2: number; y2: number; kind: "chance" | "decision"; tile: number }> = [];
-  const optionLists: Array<{ x: number; y: number; kind: "chance" | "decision"; title: string; rows: Array<{ tile: number; text: string }> }> = [];
+  const optionLists: Array<{ x: number; y: number; kind: "chance" | "decision"; title: string; rows: GraphOptionRow[]; compact?: boolean }> = [];
 
   let maxOptionListColumns = 3;
 
   let currentY = startY;
-  childRows.forEach(({ child, optionList, height }) => {
+  childRows.forEach(({ child, childTurn, optionList, height }) => {
     const childY = currentY;
     if (child.kind === "node" && child.node) {
       cards.push(
@@ -1642,6 +1748,8 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
       );
     } else if (child.kind === "agari") {
       cards.push(graphAgariCard(child, childX, childY, `${child.edgeKind === "chance" ? "Draw" : "Discard"} ${tileName(child.tile)}`));
+    } else if (child.kind === "aggregate") {
+      cards.push(graphAggregateCard(child, childX, childY));
     }
     edges.push({
       x1: rootX + GRAPH_NODE_WIDTH,
@@ -1649,7 +1757,7 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
       x2: childX,
       y2: childY + GRAPH_NODE_HEIGHT / 2,
       kind: child.edgeKind,
-      tile: child.tile
+      tile: child.kind === "aggregate" ? Tile.Null : child.tile
     });
     if (optionList && optionList.rows.length > 0) {
       optionLists.push({
@@ -1657,9 +1765,10 @@ function buildFocusedGraphLayout(result: CalculationResult, rootId: string, turn
         y: childY + 10,
         kind: optionList.kind,
         title: optionList.title,
-        rows: optionList.rows
+        rows: optionList.rows,
+        compact: optionList.compact
       });
-      const optionListColumns = Math.ceil(optionList.rows.length / GRAPH_OPTION_ROWS);
+      const optionListColumns = graphOptionListColumnCount(optionList);
       if (optionListColumns > maxOptionListColumns) {
         maxOptionListColumns = optionListColumns;
       }
@@ -1683,19 +1792,21 @@ function graphCardFromNode(
   x: number,
   y: number,
   isRoot: boolean,
-  branchLabel?: string
+  branchLabel?: string,
+  childTitle?: string
 ) {
   const immediateWinValue = nodeImmediateWinValue(node, turn);
   const lines = [
-    ...(probability < 0.999 || isRoot ? [{ text: `Prob ${formatPercent(probability)}` }] : []),
+    ...(probability < 0.999 ? [{ text: `Prob ${formatPercent(probability)}` }] : []),
     { text: `EV ${formatNumber(node.expScore[turn] ?? 0)}`, emphasis: true },
     { text: `Win ${formatPercent(node.winProb[turn] ?? 0)}` },
     { text: `Tenpai ${formatPercent(node.tenpaiProb[turn] ?? 0)}` },
     { text: immediateWinValue > 0 ? `Win value ${formatNumber(immediateWinValue)}` : `Shanten ${node.shanten}` }
   ];
   const isRiichi = node.riichi && node.shanten === 0;
-  const contentX = isRoot ? 12 : 62;
-  const hasChildTitle = !isRoot && Boolean(isRiichi);
+  const contentX = isRoot ? 12 : 80;
+  const effectiveChildTitle = !isRoot ? (childTitle ?? (isRiichi ? "Riichi" : undefined)) : undefined;
+  const hasChildTitle = Boolean(effectiveChildTitle);
   return {
     x,
     y,
@@ -1704,11 +1815,12 @@ function graphCardFromNode(
     fill: node.phase === "draw" ? "#e8f5ef" : "#fff0dd",
     stroke: isRoot ? "#111111" : "#bda983",
     strokeWidth: isRoot ? "2.4" : "1.4",
-    title: isRoot ? `${node.phase === "draw" ? "Draw" : "Discard"} node${isRiichi ? " · Riichi" : ""}` : (isRiichi ? "Riichi" : undefined),
+    title: isRoot ? `${node.phase === "draw" ? "Draw" : "Discard"} node${isRiichi ? " · Riichi" : ""}` : effectiveChildTitle,
     lines,
     branchTile: isRoot ? undefined : parseBranchTile(branchLabel),
+    action: `${node.phase === "draw" ? "Discard" : "Draw"}`,
     contentX,
-    lineStartY: isRoot ? 38 : hasChildTitle ? 36 : 22,
+    lineStartY: isRoot || hasChildTitle ? 38 : 22,
     nodeId: node.id
   };
 }
@@ -1721,6 +1833,8 @@ function graphAgariCard(
     baseScore: number;
     uradoraHitProbability: number;
     edgeKind: "chance" | "decision";
+    evContribution: number;
+    aggregate?: boolean;
   },
   x: number,
   y: number,
@@ -1735,16 +1849,65 @@ function graphAgariCard(
     stroke: "#bda983",
     strokeWidth: "1.4",
     title: "Agari",
-    lines: [
-      { text: `Prob ${formatPercent(child.probability)}` },
-      { text: `Win value ${formatNumber(child.immediateScore)}`, emphasis: true },
-      { text: `Base value ${formatNumber(child.baseScore)}` },
-      { text: `Uradora ${formatPercent(child.uradoraHitProbability)}` }
-    ],
+    lines: child.aggregate
+      ? [
+          { text: `Win prob ${formatPercent(child.probability)}` },
+          { text: `EV contrib ${formatNumber(child.evContribution)}`, emphasis: true },
+          { text: `Avg payout ${formatNumber(child.immediateScore)}` },
+          { text: `Base value ${formatInteger(child.baseScore)}` },
+          { text: `Uradora ${formatPercent(child.uradoraHitProbability)}` }
+        ]
+      : [
+          { text: `Draw prob ${formatPercent(child.probability)}` },
+          { text: `EV contrib ${formatNumber(child.evContribution)}`, emphasis: true },
+          { text: `Win value ${formatNumber(child.immediateScore)}` },
+          { text: `Base value ${formatInteger(child.baseScore)}` },
+          { text: `Uradora ${formatPercent(child.uradoraHitProbability)}` }
+        ],
     branchTile: child.tile,
     contentX: 62,
     lineStartY: 32
   };
+}
+
+function graphAggregateCard(
+  child: Extract<FocusedGraphChild, { kind: "aggregate" }>,
+  x: number,
+  y: number
+) {
+  return {
+    x,
+    y,
+    width: GRAPH_NODE_WIDTH,
+    height: GRAPH_NODE_HEIGHT,
+    fill: "#f5f5f2",
+    stroke: "#bda983",
+    strokeWidth: "1.4",
+    title: "Tsumogiri",
+    lines: [
+      { text: `Prob ${formatPercent(child.probability)}` },
+      { text: `EV ${formatNumber(child.averageExpScore)}`, emphasis: true },
+      { text: `Win ${formatPercent(child.averageWin)}` },
+      { text: `Tenpai ${formatPercent(child.averageTenpai)}` },
+      { text: `${child.branchCount} draws` }
+    ],
+    contentX: 12,
+    lineStartY: 36
+  };
+}
+
+function graphOptionListHeight(optionList: GraphOptionList): number {
+  if (optionList.compact) {
+    return 26 + Math.ceil(optionList.rows.length / GRAPH_COMPACT_OPTION_TILES_PER_ROW) * GRAPH_COMPACT_OPTION_TILE_STEP;
+  }
+  return 26 + Math.min(optionList.rows.length, GRAPH_OPTION_ROWS) * 18;
+}
+
+function graphOptionListColumnCount(optionList: GraphOptionList): number {
+  if (optionList.compact) {
+    return 1;
+  }
+  return Math.ceil(optionList.rows.length / GRAPH_OPTION_ROWS);
 }
 
 function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<string, SearchNode>) {
@@ -1754,21 +1917,47 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
   }
   if (root.phase === "draw") {
     const chanceBranches = breakdown.chanceBranches ?? [];
-    if (root.shanten === 0) {
-      return chanceBranches
-        .filter((branch) => branch.immediateScore > 0)
-        .sort((left, right) => right.immediateScore - left.immediateScore || right.probability - left.probability)
-        .map((branch) => ({
-          kind: "agari" as const,
-          tile: branch.tile,
-          probability: branch.probability,
-          immediateScore: branch.immediateScore,
-          baseScore: branch.baseScore,
-          uradoraHitProbability: branch.uradoraHitProbability,
-          edgeKind: "chance" as const
-        }));
+    const sortedAgariBranches = chanceBranches
+      .filter((branch) => branch.immediateScore > 0)
+      .sort((left, right) => (right.probability * right.immediateScore) - (left.probability * left.immediateScore) || right.probability - left.probability)
+      .map((branch) => ({
+        kind: "agari" as const,
+        tile: branch.tile,
+        probability: branch.probability,
+        immediateScore: branch.immediateScore,
+        baseScore: branch.baseScore,
+        uradoraHitProbability: branch.uradoraHitProbability,
+        edgeKind: "chance" as const,
+        evContribution: branch.probability * branch.immediateScore
+      }));
+
+    if (root.shanten === 0 && root.riichi) {
+      return (breakdown.winTileBreakdowns ?? []).map((entry) => ({
+        kind: "agari" as const,
+        tile: entry.tile,
+        probability: entry.winProbability,
+        immediateScore: entry.averageWinValue,
+        baseScore: entry.averageBaseValue,
+        uradoraHitProbability: entry.averageUradoraHitProbability,
+        edgeKind: "chance" as const,
+        evContribution: entry.evContribution,
+        aggregate: true
+      }));
     }
-    return chanceBranches
+
+    const tsumogiriBranches = root.allowTegawari
+      ? chanceBranches.filter((branch) => branch.immediateScore <= 0 && isPreferredTsumogiriBranch(root, branch, turn, nodeMap))
+      : [];
+    const tsumogiriBranchKeys = new Set(tsumogiriBranches.map((branch) => `${branch.targetNodeId}:${branch.tile}`));
+    const tsumogiriAggregate = tsumogiriBranches.length > 1
+      ? aggregateTsumogiriBranches(tsumogiriBranches)
+      : undefined;
+    const residualTsumogiriAggregate = !root.allowTegawari && !root.riichi
+      ? aggregateResidualTsumogiri(root, breakdown, turn, chanceBranches)
+      : undefined;
+
+    const sortedDecisionBranches = chanceBranches
+      .filter((branch) => !tsumogiriBranchKeys.has(`${branch.targetNodeId}:${branch.tile}`))
       .map((branch) => ({
         kind: "node" as const,
         node: nodeMap.get(branch.targetNodeId),
@@ -1776,7 +1965,10 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
         probability: branch.probability,
         immediateScore: branch.immediateScore,
         edgeKind: "chance" as const,
-        sortEv: nodeMap.get(branch.targetNodeId)?.expScore[turn] ?? branch.realizedExpScore
+        sortEv: nodeMap.get(branch.targetNodeId)?.expScore[turn] ?? branch.realizedExpScore,
+        title: nodeMap.get(branch.targetNodeId)
+          ? continuationTitle(root, nodeMap.get(branch.targetNodeId)!, Math.min(root.expScore.length - 1, turn + 1), nodeMap)
+          : undefined
       }))
       .filter((branch): branch is {
         kind: "node";
@@ -1786,8 +1978,16 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
         immediateScore: number;
         edgeKind: "chance";
         sortEv: number;
+        title: string | undefined;
       } => Boolean(branch.node))
       .sort((left, right) => right.sortEv - left.sortEv || right.probability - left.probability);
+
+    return [
+      ...sortedAgariBranches,
+      ...sortedDecisionBranches,
+      ...(tsumogiriAggregate ? [tsumogiriAggregate] : []),
+      ...(residualTsumogiriAggregate ? [residualTsumogiriAggregate] : [])
+    ];
   }
 
   return (breakdown.decisionBranches ?? [])
@@ -1798,7 +1998,8 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
       probability: 1,
       immediateScore: 0,
       edgeKind: "decision" as const,
-      sortEv: branch.expScore
+      sortEv: branch.expScore,
+      title: undefined as string | undefined
     }))
     .filter((branch): branch is {
       kind: "node";
@@ -1808,11 +2009,93 @@ function immediateGraphChildren(root: SearchNode, turn: number, nodeMap: Map<str
       immediateScore: number;
       edgeKind: "decision";
       sortEv: number;
+      title: string | undefined;
     } => Boolean(branch.node))
     .sort((left, right) => right.sortEv - left.sortEv || left.tile - right.tile);
 }
 
-function optionListForNode(node: SearchNode, turn: number) {
+function isPreferredTsumogiriBranch(
+  root: SearchNode,
+  branch: EdgeTurnBreakdown,
+  turn: number,
+  nodeMap: Map<string, SearchNode>
+): boolean {
+  const target = nodeMap.get(branch.targetNodeId);
+  if (!target || target.phase !== "discard") {
+    return false;
+  }
+  const nextTurn = transitionTurn(root.phase, target.phase, turn, Math.max(0, root.expScore.length - 1));
+  const breakdown = target.turnBreakdowns.find((item) => item.turn === nextTurn);
+  const bestDecision = breakdown?.decisionBranches
+    ?.slice()
+    .sort((left, right) => right.expScore - left.expScore || left.tile - right.tile)[0];
+  return bestDecision?.tile === branch.tile;
+}
+
+function aggregateTsumogiriBranches(branches: EdgeTurnBreakdown[]): FocusedGraphChild {
+  const probability = branches.reduce((sum, branch) => sum + branch.probability, 0);
+  const weighted = <K extends "realizedExpScore" | "targetWin" | "targetTenpai">(key: K): number => {
+    if (probability <= 0) {
+      return 0;
+    }
+    return branches.reduce((sum, branch) => sum + branch.probability * branch[key], 0) / probability;
+  };
+  const rows = branches
+    .slice()
+    .sort((left, right) => left.tile - right.tile)
+    .map((branch) => ({
+      tile: branch.tile,
+      nodeId: branch.targetNodeId
+    }));
+
+  return {
+    kind: "aggregate",
+    edgeKind: "chance",
+    probability,
+    averageExpScore: weighted("realizedExpScore"),
+    averageWin: weighted("targetWin"),
+    averageTenpai: weighted("targetTenpai"),
+    branchCount: branches.length,
+    optionList: {
+      kind: "chance",
+      title: "Collapsed draws",
+      rows,
+      compact: true
+    }
+  };
+}
+
+function aggregateResidualTsumogiri(
+  node: SearchNode,
+  breakdown: NonNullable<SearchNode["turnBreakdowns"][number]>,
+  turn: number,
+  explicitBranches: EdgeTurnBreakdown[]
+): FocusedGraphChild | undefined {
+  if (turn + 1 >= node.expScore.length || breakdown.remainingWallTiles <= 0) {
+    return undefined;
+  }
+  const explicitWeight = explicitBranches.reduce((sum, branch) => sum + branch.weight, 0);
+  const residualWeight = breakdown.remainingWallTiles - explicitWeight;
+  if (residualWeight <= 0) {
+    return undefined;
+  }
+  const explicitTiles = new Set(explicitBranches.map((branch) => branch.tile));
+  const branchCount = node.wall.reduce((count, tileCount, tile) => (
+    tileCount > 0 && !explicitTiles.has(tile) ? count + 1 : count
+  ), 0);
+
+  return {
+    kind: "aggregate",
+    edgeKind: "chance",
+    probability: residualWeight / breakdown.remainingWallTiles,
+    averageExpScore: node.expScore[turn + 1] ?? 0,
+    averageWin: node.winProb[turn + 1] ?? 0,
+    averageTenpai: node.tenpaiProb[turn + 1] ?? 0,
+    branchCount
+  };
+}
+
+function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<string, SearchNode>): GraphOptionList | undefined {
   const breakdown = node.turnBreakdowns.find((item) => item.turn === turn);
   if (!breakdown) {
     return undefined;
@@ -1841,8 +2124,10 @@ function optionListForNode(node: SearchNode, turn: number) {
     return rows.length > 0 ? { kind: "chance" as const, title: "Agari", rows } : undefined;
   }
 
-  const rows = chanceBranches
-    .slice()
+  const visibleChanceBranches = node.allowTegawari
+    ? chanceBranches.filter((branch) => !isPreferredTsumogiriBranch(node, branch, turn, nodeMap))
+    : chanceBranches;
+  const rows = visibleChanceBranches
     .sort((left, right) => right.realizedExpScore - left.realizedExpScore || right.probability - left.probability)
     .map((branch) => ({
       tile: branch.tile,
@@ -1851,11 +2136,35 @@ function optionListForNode(node: SearchNode, turn: number) {
   return rows.length > 0 ? { kind: "chance" as const, title: "Draws", rows } : undefined;
 }
 
+function continuationTitle(rootDrawNode: SearchNode, discardNode: SearchNode, turn: number, nodeMap: Map<string, SearchNode>): string | undefined {
+  if (rootDrawNode.phase !== "draw" || discardNode.phase !== "discard") {
+    return undefined;
+  }
+  const breakdown = discardNode.turnBreakdowns.find((item) => item.turn === turn);
+  const bestBranch = breakdown?.decisionBranches
+    ?.slice()
+    .sort((left, right) => right.expScore - left.expScore || left.tile - right.tile)[0];
+  const nextDraw = bestBranch ? nodeMap.get(bestBranch.sourceNodeId) : undefined;
+  if (!nextDraw) {
+    return undefined;
+  }
+  return nextDraw.shanten === rootDrawNode.shanten && nextDraw.actionMask === rootDrawNode.actionMask
+    ? "Same wait"
+    : "Hand change";
+}
+
 function nodeImmediateWinValue(node: SearchNode, turn: number): number {
   return Math.max(
     0,
     ...(node.turnBreakdowns.find((breakdown) => breakdown.turn === turn)?.chanceBranches?.map((branch) => branch.immediateScore) ?? [0])
   );
+}
+
+function transitionTurn(sourcePhase: "draw" | "discard", targetPhase: "draw" | "discard", turn: number, tMax: number): number {
+  if (sourcePhase === "draw" && targetPhase === "discard") {
+    return Math.min(tMax, turn + 1);
+  }
+  return turn;
 }
 
 function parseBranchTile(branchLabel?: string): number | undefined {
@@ -1869,6 +2178,10 @@ function parseBranchTile(branchLabel?: string): number | undefined {
 
 function formatPercent(value: number): string {
   return `${(value * 100).toFixed(2)}%`;
+}
+
+function formatInteger(value: number): string {
+  return Math.round(value).toString();
 }
 
 function formatNumber(value: number): string {

@@ -51,6 +51,11 @@ export function tilesToHand(tiles: Array<number | string>): Count {
 }
 
 export function validateHand(hand: Count): void {
+  const totalTiles = hand.reduce((a, b) => a + b, 0);
+  if (totalTiles !== 13 && totalTiles !== 14) {
+    throw new Error("Hand must have 13 or 14 tiles!");
+  }
+
   for (let i = 0; i < 34; i += 1) {
     if (hand[i] < 0 || hand[i] > 4) {
       throw new Error(`Invalid tile count at ${TILE_NAMES[i]}: ${hand[i]}`);
