@@ -473,6 +473,7 @@ export class ExpectedScoreCalculatorTs {
 
       const weight = wallCounts[tile];
       this.draw(player, handCounts, wallCounts, tile);
+      const callRiichi = config.enableRiichi && isClosed(player) && analysis.shanten === 1 && isWait ? true : riichi;
       let targetId: string;
       let scoreBreakdown: ScoreBreakdown;
       if (riichi && !(analysis.shanten === 0 && isWait)) {
@@ -502,7 +503,7 @@ export class ExpectedScoreCalculatorTs {
           wallCounts,
           handOrigin,
           shantenOrigin,
-          riichi,
+          callRiichi,
           riichi ? tile : undefined
         );
         scoreBreakdown = analysis.shanten === 0 && isWait
@@ -525,7 +526,7 @@ export class ExpectedScoreCalculatorTs {
           false,
           "chance",
           riichi,
-          riichi
+          callRiichi
         );
       }
     }
@@ -563,13 +564,12 @@ export class ExpectedScoreCalculatorTs {
         continue;
       }
 
-      const nextRiichi = riichi || (config.enableRiichi && isClosed(player) && analysis.shanten === 0 && isDiscard);
       this.discard(player, handCounts, wallCounts, tile);
       const weight = wallCounts[tile];
-      const sourceId = this.drawNode(config, round, player, engine, caches, handCounts, wallCounts, handOrigin, shantenOrigin, nextRiichi);
+      const sourceId = this.drawNode(config, round, player, engine, caches, handCounts, wallCounts, handOrigin, shantenOrigin, riichi);
       this.draw(player, handCounts, wallCounts, tile);
       const scoreBreakdown = analysis.shanten === -1
-        ? this.calcScore(config, round, player, engine, handCounts, wallCounts, analysis.shantenType, tile, nextRiichi)
+        ? this.calcScore(config, round, player, engine, handCounts, wallCounts, analysis.shantenType, tile, riichi)
         : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
 
       const edgeId = this.findEdge(sourceId, node.id, tile, "decision");
@@ -585,7 +585,7 @@ export class ExpectedScoreCalculatorTs {
           false,
           isDiscard,
           "decision",
-          nextRiichi,
+          riichi,
           riichi
         );
       }
