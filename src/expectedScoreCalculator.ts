@@ -889,8 +889,13 @@ export class ExpectedScoreCalculatorTs {
               continue;
             }
             const target = this.getNode(edge.targetId)!;
+            // A winning draw (tenpai node + winning tile) reaches an agari state
+            // with win probability 1. In riichi mode the win is modeled as a
+            // self-loop chance edge rather than a transition to a shanten === -1
+            // node, so the target's own winProb is not 1 — read the win directly.
+            const targetWin = node.shanten === 0 && edge.isWait ? 1 : target.winProb[turn + 1];
             tenpaiAccum += edge.weight * (target.tenpaiProb[turn + 1] - previousTenpai);
-            winAccum += edge.weight * (target.winProb[turn + 1] - previousWin);
+            winAccum += edge.weight * (targetWin - previousWin);
             expAccum += edge.weight * (Math.max(edge.score, target.expScore[turn + 1]) - previousExpScore);
           }
 
@@ -1407,6 +1412,10 @@ export class ExpectedScoreCalculatorTs {
             const edge = this.getEdge(edgeId)!;
             const target = this.getNode(edge.targetId)!;
             const realizedExpScore = Math.max(edge.score, target.expScore[turn + 1] ?? 0);
+            // A winning draw reaches an agari state (win probability 1); in riichi
+            // mode this is a self-loop edge whose target winProb is not 1, so read
+            // the win directly. Mirrors the winProb induction in calcStats().
+            const targetWin = node.shanten === 0 && edge.isWait ? 1 : (target.winProb[turn + 1] ?? 0);
             return {
               tile: edge.tile,
               targetNodeId: target.id,
@@ -1416,10 +1425,10 @@ export class ExpectedScoreCalculatorTs {
               baseScore: edge.baseScore,
               uradoraHitProbability: edge.uradoraHitProbability,
               targetTenpai: target.tenpaiProb[turn + 1] ?? 0,
-              targetWin: target.winProb[turn + 1] ?? 0,
+              targetWin,
               targetExpScore: target.expScore[turn + 1] ?? 0,
               contributionTenpai: denominator > 0 ? edge.weight * ((target.tenpaiProb[turn + 1] ?? 0) - previousTenpai) / denominator : 0,
-              contributionWin: denominator > 0 ? edge.weight * ((target.winProb[turn + 1] ?? 0) - previousWin) / denominator : 0,
+              contributionWin: denominator > 0 ? edge.weight * (targetWin - previousWin) / denominator : 0,
               contributionExpScore: denominator > 0 ? edge.weight * (realizedExpScore - previousExpScore) / denominator : 0,
               realizedExpScore
             };
@@ -1512,10 +1521,6 @@ export class ExpectedScoreCalculatorTs {
     if (denominator <= 0) {
       return [];
     }
-    const probabilityDenominator = node.wallSize;
-    if (probabilityDenominator <= 0) {
-      return [];
-    }
 
     const aggregates = new Map<number, InternalDrawTileAggregate>();
     let totalBranchWeight = 0;
@@ -1526,8 +1531,10 @@ export class ExpectedScoreCalculatorTs {
       }
 
       totalBranchWeight += edge.weight;
+      // Use the same turn denominator (sum - turn) as the winProb / tenpaiProb /
+      // expScore induction in calcStats(). A separate wall-size denominator would
+      // produce probabilities that do not reconcile with the node's winProb.
       const evProbability = edge.weight / denominator;
-      const eventProbability = edge.weight / probabilityDenominator;
       const target = this.getNode(edge.targetId);
       const targetTurn = Math.min(config.tMax, turn + 1);
       if (edge.score > 0) {
@@ -1535,12 +1542,12 @@ export class ExpectedScoreCalculatorTs {
         this.addDrawTileAggregate(
           aggregates,
           edge.tile,
-          eventProbability,
+          evProbability,
           evProbability * realizedValue,
-          eventProbability * realizedValue,
-          eventProbability,
-          eventProbability * edge.baseScore,
-          eventProbability * edge.uradoraHitProbability,
+          evProbability * realizedValue,
+          evProbability,
+          evProbability * edge.baseScore,
+          evProbability * edge.uradoraHitProbability,
           undefined,
           true
         );
@@ -1557,23 +1564,27 @@ export class ExpectedScoreCalculatorTs {
       if (bestDecision?.tile === edge.tile && source) {
         const childAggregates = this.aggregateDrawTilesMap(source.id, targetTurn, config);
         childAggregates.forEach((value, tile) => {
-          this.addDrawTileAggregateFromValue(aggregates, tile, eventProbability, evProbability, value);
+          this.addDrawTileAggregateFromValue(aggregates, tile, evProbability, evProbability, value);
         });
         continue;
       }
 
+      // A hand-improving draw (best discard keeps the drawn tile) is shown as a
+      // single navigable child rather than being collapsed/recursed. Fold its
+      // downstream win probability into edge.tile so the per-tile win figures
+      // still sum to node.winProb — mirroring the per-edge winProb contribution
+      // (evProbability * target.winProb[turn + 1]) in calcStats().
       const value = Math.max(edge.score, target.expScore[targetTurn] ?? 0);
-      this.addDrawTileAggregate(aggregates, edge.tile, eventProbability, evProbability * value, eventProbability * value, 0, 0, 0, target.id, false);
+      const downstreamWin = target.winProb[targetTurn] ?? 0;
+      this.addDrawTileAggregate(aggregates, edge.tile, evProbability, evProbability * value, evProbability * value, evProbability * downstreamWin, 0, 0, target.id, false);
     }
 
     const residualWeight = denominator - totalBranchWeight;
     if (Math.abs(residualWeight) > 1e-9) {
       const residualEvProbability = residualWeight / denominator;
-      const residualEventWeight = Math.max(0, probabilityDenominator - totalBranchWeight);
-      const residualEventProbability = residualEventWeight / probabilityDenominator;
       const residualAggregates = this.aggregateDrawTilesMap(node.id, turn + 1, config);
       residualAggregates.forEach((value, tile) => {
-        this.addDrawTileAggregateFromValue(aggregates, tile, residualEventProbability, residualEvProbability, value);
+        this.addDrawTileAggregateFromValue(aggregates, tile, residualEvProbability, residualEvProbability, value);
       });
     }
 
