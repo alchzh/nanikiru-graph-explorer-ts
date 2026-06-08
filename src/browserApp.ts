@@ -75,6 +75,7 @@ interface AppState {
   jsonDraft: string;
   result?: CalculationResult;
   graphResult?: CalculationResult;
+  graphFocusHistory: Array<{ nodeId: NodeId; turn: number }>;
   selectedTurn: number;
   isComputing: boolean;
   computingLabel?: string;
@@ -192,6 +193,7 @@ export function mountBrowserApp(root: HTMLElement): void {
   const state: AppState = {
     editor: initialEditor,
     jsonDraft: JSON.stringify(editorStateToScenario(initialEditor), null, 2),
+    graphFocusHistory: [],
     selectedTurn: initialEditor.currentTurn,
     isComputing: false
   };
@@ -199,10 +201,11 @@ export function mountBrowserApp(root: HTMLElement): void {
   const rerender = (): void => {
     root.innerHTML = "";
     root.classList.toggle("is-computing", state.isComputing);
+    document.body.classList.toggle("is-computing", state.isComputing);
     root.setAttribute("aria-busy", state.isComputing ? "true" : "false");
     const layout = document.createElement("div");
     layout.className = "layout";
-    layout.append(renderControls(state, rerender, runAnalysis), renderResults(state, rerender, focusGraphOnNode));
+    layout.append(renderControls(state, rerender, runAnalysis), renderResults(state, rerender, focusGraphOnNode, goBackGraphFocus));
     setInteractionDisabled(layout, state.isComputing);
     root.append(layout);
   };
@@ -272,36 +275,47 @@ export function mountBrowserApp(root: HTMLElement): void {
       return;
     }
     const currentGraph = state.graphResult ?? state.result;
-    const currentRoot = currentGraph.rootNodeId !== undefined
+    const currentRootId = currentGraph.rootNodeId;
+    const currentRoot = currentRootId !== undefined
       ? currentGraph.nodes.find((candidate) => candidate.id === currentGraph.rootNodeId)
       : undefined;
-    if (currentRoot) {
-      state.selectedTurn = transitionTurn(currentRoot.phase, node.phase, state.selectedTurn, state.editor.config.tMax);
-    }
-    const token = computationToken + 1;
-    computationToken = token;
+    const nextTurn = currentRoot
+      ? transitionTurn(currentRoot.phase, node.phase, state.selectedTurn, state.editor.config.tMax)
+      : state.selectedTurn;
     state.error = undefined;
-    state.isComputing = true;
-    state.computingLabel = "Loading graph...";
-    rerender();
 
     try {
       const graphResult = await snapshotInWorker(node.id, GRAPH_SNAPSHOT_DEPTH);
-      if (token !== computationToken) {
-        return;
+      if (currentRootId !== undefined && currentRootId !== node.id) {
+        state.graphFocusHistory.push({ nodeId: currentRootId, turn: state.selectedTurn });
       }
+      state.selectedTurn = nextTurn;
       state.graphResult = graphResult;
+      rerender();
     } catch (error) {
-      if (token !== computationToken) {
-        return;
-      }
       state.error = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (token === computationToken) {
-        state.isComputing = false;
-        state.computingLabel = undefined;
-        rerender();
+      rerender();
+    }
+  };
+
+  const goBackGraphFocus = async (): Promise<void> => {
+    if (!state.result || state.graphFocusHistory.length === 0) {
+      return;
+    }
+    const previous = state.graphFocusHistory.pop()!;
+    state.error = undefined;
+    try {
+      if (previous.nodeId === state.result.rootNodeId) {
+        state.graphResult = undefined;
+      } else {
+        state.graphResult = await snapshotInWorker(previous.nodeId, GRAPH_SNAPSHOT_DEPTH);
       }
+      state.selectedTurn = previous.turn;
+      rerender();
+    } catch (error) {
+      state.graphFocusHistory.push(previous);
+      state.error = error instanceof Error ? error.message : String(error);
+      rerender();
     }
   };
 
@@ -329,6 +343,7 @@ export function mountBrowserApp(root: HTMLElement): void {
       state.result = result;
       state.selectedTurn = state.editor.currentTurn;
       state.graphResult = undefined;
+      state.graphFocusHistory = [];
       state.jsonDraft = JSON.stringify(editorStateToScenario(state.editor), null, 2);
     } catch (error) {
       if (token !== computationToken) {
@@ -336,6 +351,7 @@ export function mountBrowserApp(root: HTMLElement): void {
       }
       state.result = undefined;
       state.graphResult = undefined;
+      state.graphFocusHistory = [];
       state.error = error instanceof Error ? error.message : String(error);
     } finally {
       if (token === computationToken) {
@@ -376,7 +392,7 @@ function renderControls(state: AppState, rerender: () => void, runAnalysis: () =
     renderScenarioBoard(state, rerender),
     renderPystyleTabBar(state, rerender),
     renderPystyleTabPanel(state, rerender),
-    renderJsonPanel(state, rerender, runAnalysis)
+    // renderJsonPanel(state, rerender, runAnalysis)
   );
 
   const actions = document.createElement("div");
@@ -396,10 +412,24 @@ function renderControls(state: AppState, rerender: () => void, runAnalysis: () =
     state.jsonDraft = JSON.stringify(editorStateToScenario(state.editor), null, 2);
     state.result = undefined;
     state.graphResult = undefined;
+    state.graphFocusHistory = [];
     rerender();
   });
 
-  actions.append(analyze, reset);
+  const clearHand = document.createElement("button");
+  clearHand.className = "secondary";
+  clearHand.textContent = "Clear hand";
+  clearHand.disabled = state.editor.handTiles.length === 0 && state.editor.melds.length === 0 && state.editor.currentMeldTiles.length === 0;
+  clearHand.addEventListener("click", () => {
+    state.editor.handTiles = [];
+    state.editor.melds = [];
+    state.editor.currentMeldTiles = [];
+    state.graphResult = undefined;
+    state.graphFocusHistory = [];
+    rerender();
+  });
+
+  actions.append(analyze, clearHand, reset);
   if (state.isComputing) {
     const status = document.createElement("span");
     status.className = "busy-status";
@@ -1188,7 +1218,12 @@ function renderJsonPanel(state: AppState, rerender: () => void, runAnalysis: () 
   return details;
 }
 
-function renderResults(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => Promise<void>): HTMLElement {
+function renderResults(
+  state: AppState,
+  rerender: () => void,
+  focusGraphOnNode: (node?: SearchNode) => Promise<void>,
+  goBackGraphFocus: () => Promise<void>
+): HTMLElement {
   const section = document.createElement("section");
   section.className = "results";
 
@@ -1206,7 +1241,7 @@ function renderResults(state: AppState, rerender: () => void, focusGraphOnNode: 
 
   section.append(
     // renderSummary(state.result),
-    renderGraphSection(state, rerender, focusGraphOnNode)
+    renderGraphSection(state, rerender, focusGraphOnNode, goBackGraphFocus)
   );
 
   return section;
@@ -1229,7 +1264,12 @@ function renderSummary(result: CalculationResult): HTMLElement {
   return section;
 }
 
-function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnNode: (node?: SearchNode) => Promise<void>): HTMLElement {
+function renderGraphSection(
+  state: AppState,
+  rerender: () => void,
+  focusGraphOnNode: (node?: SearchNode) => Promise<void>,
+  goBackGraphFocus: () => Promise<void>
+): HTMLElement {
   const section = document.createElement("section");
   section.className = "panel section";
   section.innerHTML = "<h2>Game tree graph</h2>";
@@ -1256,9 +1296,10 @@ function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnN
   if (focusNode) {
     focusBar.append(renderGraphFocusHand(state.editor, focusNode, state.graphResult ? () => {
       state.graphResult = undefined;
+      state.graphFocusHistory = [];
       state.selectedTurn = state.editor.currentTurn;
       rerender();
-    } : undefined));
+    } : undefined, state.graphFocusHistory.length ? goBackGraphFocus : undefined));
   }
   section.append(focusBar);
 
@@ -1277,16 +1318,33 @@ function renderGraphSection(state: AppState, rerender: () => void, focusGraphOnN
   return section;
 }
 
-function renderGraphFocusHand(editor: EditorState, node: SearchNode, onResetFocus?: () => void): HTMLElement {
+function renderGraphFocusHand(editor: EditorState, node: SearchNode, onResetFocus?: () => void, goBackGraphFocus?: () => Promise<void>): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "graph-focus-hand";
 
   const label = document.createElement("div");
   label.className = "field";
-  const title = document.createElement("span");
-  title.className = "field-label";
-  title.textContent = "Current hand";
-  label.append(title);
+
+  const back = document.createElement("button");
+  back.className = "secondary graph-focus-action";
+  back.textContent = "Back";
+  back.addEventListener("click", () => {
+    if (goBackGraphFocus) void goBackGraphFocus();
+  });
+  label.append(back);
+
+  const resetFocus = document.createElement("button");
+  resetFocus.className = "secondary graph-focus-action";
+  resetFocus.textContent = "Original root";
+  resetFocus.addEventListener("click", () => {
+    if (onResetFocus) void onResetFocus();
+  });
+  label.append(resetFocus);
+
+  // const title = document.createElement("span");
+  // title.className = "field-label";
+  // title.textContent = "Current hand";
+  // label.append(title);
 
   const hand = document.createElement("div");
   hand.className = "graph-focus-tiles";
@@ -1299,13 +1357,6 @@ function renderGraphFocusHand(editor: EditorState, node: SearchNode, onResetFocu
   }
 
   label.append(hand);
-  if (onResetFocus) {
-    const resetFocus = document.createElement("button");
-    resetFocus.className = "secondary graph-focus-action";
-    resetFocus.textContent = "Original root";
-    resetFocus.addEventListener("click", onResetFocus);
-    label.append(resetFocus);
-  }
   wrap.append(label);
   return wrap;
 }
@@ -2456,13 +2507,33 @@ function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<NodeId, 
 
   const chanceBranches = breakdown.chanceBranches ?? [];
   if (node.shanten === 0) {
+    const tileBreakdownMap = new Map((breakdown.tileBreakdowns ?? []).map((entry) => [entry.tile, entry]));
     const rows = chanceBranches
       .filter((branch) => branch.immediateScore > 0)
-      .sort((left, right) => right.immediateScore - left.immediateScore || right.probability - left.probability)
-      .map((branch) => ({
-        tile: branch.tile,
-        text: `${formatPercent(branch.probability)} · ${formatNumber(branch.immediateScore)}`
-      }));
+      .reduce((branches, branch) => {
+        if (!branches.some((item) => item.tile === branch.tile)) {
+          branches.push(branch);
+        }
+        return branches;
+      }, [] as EdgeTurnBreakdown[])
+      .sort((left, right) => {
+        const leftAggregate = tileBreakdownMap.get(left.tile);
+        const rightAggregate = tileBreakdownMap.get(right.tile);
+        const leftEv = leftAggregate?.evContribution ?? left.contributionExpScore;
+        const rightEv = rightAggregate?.evContribution ?? right.contributionExpScore;
+        const leftProbability = leftAggregate?.probability ?? left.probability;
+        const rightProbability = rightAggregate?.probability ?? right.probability;
+        return rightEv - leftEv || rightProbability - leftProbability;
+      })
+      .map((branch) => {
+        const aggregate = tileBreakdownMap.get(branch.tile);
+        return {
+          tile: branch.tile,
+          text: aggregate
+            ? `EVc ${formatNumber(aggregate.evContribution)} · p ${formatPercent(aggregate.probability)}`
+            : `EVc ${formatNumber(branch.contributionExpScore)} · p ${formatPercent(branch.probability)}`
+        };
+      });
     return rows.length > 0 ? { kind: EdgeKind.Chance, title: "Agari", rows } : undefined;
   }
 
@@ -2477,12 +2548,32 @@ function optionListForNode(node: SearchNode, turn: number, nodeMap: Map<NodeId, 
         const target = nodeMap.get(branch.targetNodeId);
         return target ? hasDisplayableGraphContinuation(target, transitionTurn(node.phase, target.phase, turn, Math.max(0, node.expScore.length - 1)), nodeMap) : false;
       });
+  const tileBreakdownMap = new Map((breakdown.tileBreakdowns ?? []).map((entry) => [entry.tile, entry]));
   const rows = visibleChanceBranches
-    .sort((left, right) => right.realizedExpScore - left.realizedExpScore || right.probability - left.probability)
-    .map((branch) => ({
-      tile: branch.tile,
-      text: `${formatPercent(branch.probability)} · EV ${formatNumber(branch.realizedExpScore)}`
-    }));
+    .reduce((branches, branch) => {
+      if (!branches.some((item) => item.tile === branch.tile)) {
+        branches.push(branch);
+      }
+      return branches;
+    }, [] as EdgeTurnBreakdown[])
+    .sort((left, right) => {
+      const leftAggregate = tileBreakdownMap.get(left.tile);
+      const rightAggregate = tileBreakdownMap.get(right.tile);
+      const leftEv = leftAggregate?.evContribution ?? left.contributionExpScore;
+      const rightEv = rightAggregate?.evContribution ?? right.contributionExpScore;
+      const leftProbability = leftAggregate?.probability ?? left.probability;
+      const rightProbability = rightAggregate?.probability ?? right.probability;
+      return rightEv - leftEv || rightProbability - leftProbability;
+    })
+    .map((branch) => {
+      const aggregate = tileBreakdownMap.get(branch.tile);
+      return {
+        tile: branch.tile,
+        text: aggregate
+          ? `EVc ${formatNumber(aggregate.evContribution)} · p ${formatPercent(aggregate.probability)}`
+          : `EVc ${formatNumber(branch.contributionExpScore)} · p ${formatPercent(branch.probability)}`
+      };
+    });
   return rows.length > 0 ? { kind: EdgeKind.Chance, title: "Draws", rows } : undefined;
 }
 

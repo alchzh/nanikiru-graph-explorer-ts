@@ -1,10 +1,10 @@
-import { BruteForceMahjongEngine } from "./analyzers.js";
+import { PystyleMahjongEngine } from "./analyzers.js";
 import { ExpectedScoreCalculatorTs } from "./expectedScoreCalculator.js";
 import { TypeScriptScoreEngine } from "./scoreCalculator.js";
 import type { ExpectedScoreWorkerRequest, ExpectedScoreWorkerResponse } from "./workerProtocol.js";
 
-const shantenEngine = new BruteForceMahjongEngine();
-const engine = new BruteForceMahjongEngine({ scoring: new TypeScriptScoreEngine(shantenEngine) });
+const shantenEngine = new PystyleMahjongEngine();
+const engine = new PystyleMahjongEngine({ scoring: new TypeScriptScoreEngine(shantenEngine) });
 const calculator = new ExpectedScoreCalculatorTs();
 
 const workerScope = self as unknown as {

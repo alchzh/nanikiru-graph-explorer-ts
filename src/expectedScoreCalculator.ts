@@ -25,7 +25,6 @@ import {
   clonePlayer,
   isClosed,
   isReddora,
-  maskHas,
   numPlayerTiles,
   toNoReddora
 } from "./utils.js";
@@ -35,14 +34,16 @@ const COUNT_PACK_BITS = 111n;
 const COUNT_PACK_MASK = (1n << COUNT_PACK_BITS) - 1n;
 
 interface CacheState {
-  draw: Map<CacheKey, NodeId>;
-  discard: Map<CacheKey, NodeId>;
+  draw: Map<string, NodeId>;
+  discard: Map<string, NodeId>;
 }
 
 interface NodeBuildInfo {
   shantenType: number;
   shanten: number;
   actionMask: bigint;
+  actionMaskLow: number;
+  actionMaskHigh: number;
   allowTegawari: boolean;
   allowShantenDown: boolean;
   forcedDiscardTile?: number;
@@ -89,7 +90,7 @@ interface InternalTileBreakdown {
 interface InternalSearchNode {
   id: NodeId;
   phase: NodePhase;
-  stateKey: CacheKey;
+  stateKey?: CacheKey;
   wallSize: number;
   forcedDiscardTile?: number;
   shantenType: number;
@@ -99,6 +100,10 @@ interface InternalSearchNode {
   allowTegawari: boolean;
   allowShantenDown: boolean;
   actionMask: bigint;
+  actionMaskLow: number;
+  actionMaskHigh: number;
+  handCounts: CountRed;
+  wallCounts: CountRed;
   outgoingEdgeIds: EdgeId[];
   incomingEdgeIds: EdgeId[];
   tenpaiProb: Float64Array;
@@ -130,15 +135,55 @@ interface CalculationSnapshotState {
   context: CalculationResult["context"];
 }
 
+interface BuildContext {
+  config: Config;
+  round: Round;
+  engine: MahjongAnalysisEngine;
+  caches: CacheState;
+  handOrigin: CountRed;
+  shantenOrigin: number;
+  numMelds: number;
+  isClosed: boolean;
+  playerWind: number;
+  playerMelds: Player["melds"];
+}
+
+interface BuildTask {
+  phase: NodePhase;
+  nodeId: NodeId;
+  riichi: boolean;
+  forcedDiscardTile?: number;
+}
+
+interface EnsureNodeResult {
+  nodeId: NodeId;
+  isNew: boolean;
+}
+
+interface MaskTileAnalysis {
+  shantenType: number;
+  shanten: number;
+  maskLow: number;
+  maskHigh: number;
+}
+
+interface MaskAnalysisEngine extends MahjongAnalysisEngine {
+  analyzeNecessaryMasks?(hand: Count, numMelds: number, type: number): MaskTileAnalysis;
+  analyzeUnnecessaryMasks?(hand: Count, numMelds: number, type: number): MaskTileAnalysis;
+}
+
 export class ExpectedScoreCalculatorTs {
   private readonly nodes: Array<InternalSearchNode | undefined> = [];
   private readonly edges: Array<InternalSearchEdge | undefined> = [];
   private readonly warnings: string[] = [];
   private readonly drawTileAggregateCache = new Map<number, InternalTileBreakdown[]>();
+  private readonly sharedStatArrays = new Map<string, Float64Array>();
   private drawCacheHits = 0;
   private discardCacheHits = 0;
   private nodeCounter = 0;
   private edgeCounter = 0;
+  private drawNodeCounter = 0;
+  private discardNodeCounter = 0;
   private lastSnapshotState?: CalculationSnapshotState;
 
   calc(
@@ -157,6 +202,8 @@ export class ExpectedScoreCalculatorTs {
     this.discardCacheHits = 0;
     this.nodeCounter = 0;
     this.edgeCounter = 0;
+    this.drawNodeCounter = 0;
+    this.discardNodeCounter = 0;
     this.lastSnapshotState = undefined;
 
     const graphDepthLimit = Math.max(0, options.graphDepthLimit ?? 2);
@@ -200,12 +247,24 @@ export class ExpectedScoreCalculatorTs {
     }
 
     if (options.startNode?.phase === NodePhase.Draw || (!options.startNode && numTiles === 13)) {
-      rootNodeId = this.drawNode(config, round, player, engine, caches, handCounts, wallCounts, handOrigin, shantenOrigin, riichi);
+      rootNodeId = this.buildNodeGraph(
+        config,
+        round,
+        player,
+        engine,
+        caches,
+        handCounts,
+        wallCounts,
+        handOrigin,
+        shantenOrigin,
+        NodePhase.Draw,
+        riichi
+      );
       rootPhase = NodePhase.Draw;
       if (config.calcStats) {
         this.calcStats(config);
       }
-      const rootId = caches.draw.get(this.createCacheKey(handCounts, wallCounts, riichi));
+      const rootId = caches.draw.get(this.createHandCacheKey(handCounts, riichi));
       if (rootId !== undefined) {
         const root = this.getNode(rootId)!;
         const necessary = this.getNecessaryTiles(config, player, wall, engine);
@@ -220,7 +279,7 @@ export class ExpectedScoreCalculatorTs {
         });
       }
     } else {
-      rootNodeId = this.discardNode(
+      rootNodeId = this.buildNodeGraph(
         config,
         round,
         player,
@@ -230,6 +289,7 @@ export class ExpectedScoreCalculatorTs {
         wallCounts,
         handOrigin,
         shantenOrigin,
+        NodePhase.Discard,
         riichi,
         options.startNode?.forcedDiscardTile
       );
@@ -243,7 +303,7 @@ export class ExpectedScoreCalculatorTs {
           continue;
         }
         this.discard(player, handCounts, wallCounts, tile);
-        const nodeId = caches.draw.get(this.createCacheKey(handCounts, wallCounts, riichi));
+        const nodeId = caches.draw.get(this.createHandCacheKey(handCounts, riichi));
         if (nodeId !== undefined) {
           const node = this.getNode(nodeId)!;
           const necessary = this.getNecessaryTiles(config, player, wall, engine);
@@ -264,8 +324,8 @@ export class ExpectedScoreCalculatorTs {
     const search: SearchSummary = {
       searchedVertices: this.nodeCounter,
       searchedEdges: this.edgeCounter,
-      drawNodes: this.allNodes().filter((node) => node.phase === NodePhase.Draw).length,
-      discardNodes: this.allNodes().filter((node) => node.phase === NodePhase.Discard).length,
+      drawNodes: this.drawNodeCounter,
+      discardNodes: this.discardNodeCounter,
       drawCacheHits: this.drawCacheHits,
       discardCacheHits: this.discardCacheHits
     };
@@ -497,216 +557,314 @@ export class ExpectedScoreCalculatorTs {
     return { expectedScore: score, baseScore, uradoraHitProbability };
   }
 
-  private drawNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean): NodeId {
-    const key = this.createCacheKey(handCounts, wallCounts, riichi);
-    const cachedId = caches.draw.get(key);
-    if (cachedId !== undefined) {
-      this.drawCacheHits += 1;
-      return cachedId;
+  private buildNodeGraph(
+    config: Config,
+    round: Round,
+    player: Player,
+    engine: MahjongAnalysisEngine,
+    caches: CacheState,
+    handCounts: CountRed,
+    wallCounts: CountRed,
+    handOrigin: CountRed,
+    shantenOrigin: number,
+    rootPhase: NodePhase,
+    riichi: boolean,
+    forcedDiscardTile?: number
+  ): NodeId {
+    const context: BuildContext = {
+      config,
+      round,
+      engine,
+      caches,
+      handOrigin,
+      shantenOrigin,
+      numMelds: player.melds.length,
+      isClosed: isClosed(player),
+      playerWind: player.wind,
+      playerMelds: player.melds.map((meld) => ({
+        type: meld.type,
+        tiles: meld.tiles.slice(),
+        discardedTile: meld.discardedTile,
+        from: meld.from
+      }))
+    };
+    const stack: BuildTask[] = [];
+    const root = rootPhase === NodePhase.Draw
+      ? this.ensureDrawNode(context, handCounts, wallCounts, riichi)
+      : this.ensureDiscardNode(context, handCounts, wallCounts, riichi, forcedDiscardTile);
+
+    if (root.isNew) {
+      stack.push({
+        phase: rootPhase,
+        nodeId: root.nodeId,
+        riichi,
+        forcedDiscardTile
+      });
     }
 
-    const analysis = engine.analyzeNecessary(player.hand, player.melds.length, config.shantenType);
-    const waitMask = this.extendMaskWithRedFives(this.tilesToMask(analysis.tiles));
-    const allowTegawari = !riichi && config.enableTegawari && this.distance(handCounts, handOrigin) + analysis.shanten < shantenOrigin + config.extra;
-    const node = this.addNode(NodePhase.Draw, key, handCounts, wallCounts, {
+    while (stack.length > 0) {
+      const task = stack.pop()!;
+      if (task.phase === NodePhase.Draw) {
+        this.expandDrawNode(context, task, stack);
+      } else {
+        this.expandDiscardNode(context, task, stack);
+      }
+    }
+
+    return root.nodeId;
+  }
+
+  private ensureDrawNode(context: BuildContext, handCounts: CountRed, wallCounts: CountRed, riichi: boolean): EnsureNodeResult {
+    const key = this.createHandCacheKey(handCounts, riichi);
+    const cachedId = context.caches.draw.get(key);
+    if (cachedId !== undefined) {
+      this.drawCacheHits += 1;
+      return { nodeId: cachedId, isNew: false };
+    }
+
+    const hand = this.decodeForDisplay(handCounts);
+    const analysis = this.analyzeNecessaryMasks(context.engine, hand, context.numMelds, context.config.shantenType);
+    const waitMask = this.extendMaskAnalysisWithRedFives(analysis.maskLow, analysis.maskHigh);
+    const originDistance = this.distance(handCounts, context.handOrigin);
+    const allowTegawari = !riichi && context.config.enableTegawari && originDistance + analysis.shanten < context.shantenOrigin + context.config.extra;
+    const node = this.addNode(NodePhase.Draw, undefined, handCounts, wallCounts, {
       shantenType: analysis.shantenType,
       shanten: analysis.shanten,
-      actionMask: waitMask,
+      actionMask: waitMask.bigintMask,
+      actionMaskLow: waitMask.low,
+      actionMaskHigh: waitMask.high,
       allowTegawari,
       allowShantenDown: false
-    }, riichi, config, this.distance(handCounts, handOrigin));
-    caches.draw.set(key, node.id);
+    }, riichi, context.config, originDistance);
+    context.caches.draw.set(key, node.id);
+    return { nodeId: node.id, isNew: true };
+  }
 
-    if (riichi && analysis.shanten === 0) {
+  private ensureDiscardNode(context: BuildContext, handCounts: CountRed, wallCounts: CountRed, riichi: boolean, forcedDiscardTile?: number): EnsureNodeResult {
+    const key = this.createHandCacheKey(handCounts, riichi, forcedDiscardTile);
+    const cachedId = context.caches.discard.get(key);
+    if (cachedId !== undefined) {
+      this.discardCacheHits += 1;
+      return { nodeId: cachedId, isNew: false };
+    }
+
+    const hand = this.decodeForDisplay(handCounts);
+    const analysis = this.analyzeUnnecessaryMasks(context.engine, hand, context.numMelds, context.config.shantenType);
+    const discardMask = this.extendMaskAnalysisWithRedFives(analysis.maskLow, analysis.maskHigh);
+    const originDistance = this.distance(handCounts, context.handOrigin);
+    const allowShantenDown = context.config.enableShantenDown && originDistance + analysis.shanten < context.shantenOrigin + context.config.extra;
+    const node = this.addNode(NodePhase.Discard, undefined, handCounts, wallCounts, {
+      shantenType: analysis.shantenType,
+      shanten: analysis.shanten,
+      actionMask: discardMask.bigintMask,
+      actionMaskLow: discardMask.low,
+      actionMaskHigh: discardMask.high,
+      allowTegawari: false,
+      allowShantenDown,
+      forcedDiscardTile
+    }, riichi, context.config, originDistance);
+    context.caches.discard.set(key, node.id);
+    return { nodeId: node.id, isNew: true };
+  }
+
+  private expandDrawNode(context: BuildContext, task: BuildTask, stack: BuildTask[]): void {
+    const node = this.getNode(task.nodeId);
+    if (!node) {
+      return;
+    }
+    const handCounts = node.handCounts;
+    const wallCounts = node.wallCounts;
+
+    if (task.riichi && node.shanten === 0) {
       for (let tile = 0; tile < 37; tile += 1) {
-        if (wallCounts[tile] <= 0) {
+        if (wallCounts[tile] <= 0 || !this.maskHasRuntime(node, tile)) {
           continue;
         }
 
         const weight = wallCounts[tile];
-        this.draw(player, handCounts, wallCounts, tile);
-        const handAnalysis = engine.calculateShanten(player.hand, player.melds.length, analysis.shantenType);
-        if (handAnalysis.shanten < 0) {
-          const scoreBreakdown = this.calcScore(
-            config,
-            round,
-            player,
-            engine,
-            handCounts,
-            wallCounts,
-            analysis.shantenType,
-            tile,
-            true
-          );
-          if (scoreBreakdown.expectedScore > 0) {
-            const targetId = this.discardNode(
-              config,
-              round,
-              player,
-              engine,
-              caches,
-              handCounts,
-              wallCounts,
-              handOrigin,
-              shantenOrigin,
-              true,
-              tile
-            );
-            const edgeId = this.findEdge(node.id, targetId, tile, EdgeKind.Chance);
-            if (edgeId === undefined) {
-              this.addEdge(
-                node.id,
-                targetId,
-                tile,
-                weight,
-                scoreBreakdown.expectedScore,
-                scoreBreakdown.baseScore,
-                scoreBreakdown.uradoraHitProbability,
-                true,
-                false,
-                EdgeKind.Chance,
-                true,
-                true
-              );
-            }
-          }
-        }
-        this.discard(player, handCounts, wallCounts, tile);
-      }
-
-      return node.id;
-    }
-
-    for (let tile = 0; tile < 37; tile += 1) {
-      const isWait = maskHas(waitMask, tile);
-      if (wallCounts[tile] <= 0 || (!allowTegawari && !isWait)) {
-        continue;
-      }
-
-      const weight = wallCounts[tile];
-      this.draw(player, handCounts, wallCounts, tile);
-      const callRiichi = config.enableRiichi && isClosed(player) && analysis.shanten === 1 && isWait ? true : riichi;
-      let targetId: NodeId;
-      let scoreBreakdown: ScoreBreakdown;
-      if (riichi && !(analysis.shanten === 0 && isWait)) {
-        this.discard(player, handCounts, wallCounts, tile);
-        targetId = this.drawNode(
-          config,
-          round,
-          player,
-          engine,
-          caches,
-          handCounts,
-          wallCounts,
-          handOrigin,
-          shantenOrigin,
+        const child = this.drawCounts(handCounts, wallCounts, tile);
+        const childPlayer = this.createPlayerForState(context, child.handCounts);
+        const scoreBreakdown = this.calcScore(
+          context.config,
+          context.round,
+          childPlayer,
+          context.engine,
+          child.handCounts,
+          child.wallCounts,
+          node.shantenType,
+          tile,
           true
         );
-        this.draw(player, handCounts, wallCounts, tile);
-        scoreBreakdown = { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
-      } else {
-        targetId = this.discardNode(
-          config,
-          round,
-          player,
-          engine,
-          caches,
-          handCounts,
-          wallCounts,
-          handOrigin,
-          shantenOrigin,
-          callRiichi,
-          riichi ? tile : undefined
-        );
-        scoreBreakdown = analysis.shanten === 0 && isWait
-          ? this.calcScore(config, round, player, engine, handCounts, wallCounts, analysis.shantenType, tile, riichi)
-          : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
-      }
-      this.discard(player, handCounts, wallCounts, tile);
+        if (scoreBreakdown.expectedScore <= 0) {
+          continue;
+        }
 
-      const edgeId = this.findEdge(node.id, targetId, tile, EdgeKind.Chance);
-      if (edgeId === undefined) {
-        this.addEdge(
+        this.addEdgeIfMissing(
           node.id,
-          targetId,
+          node.id,
           tile,
           weight,
-          scoreBreakdown.expectedScore,
-          scoreBreakdown.baseScore,
-          scoreBreakdown.uradoraHitProbability,
-          isWait,
+          scoreBreakdown,
+          true,
           false,
           EdgeKind.Chance,
-          riichi,
-          callRiichi
+          true,
+          true
         );
       }
+      return;
     }
-
-    return node.id;
-  }
-
-  private discardNode(config: Config, round: Round, player: Player, engine: MahjongAnalysisEngine, caches: CacheState, handCounts: CountRed, wallCounts: CountRed, handOrigin: CountRed, shantenOrigin: number, riichi: boolean, forcedDiscardTile?: number): NodeId {
-    const key = this.createCacheKey(handCounts, wallCounts, riichi, forcedDiscardTile);
-    const cachedId = caches.discard.get(key);
-    if (cachedId !== undefined) {
-      this.discardCacheHits += 1;
-      return cachedId;
-    }
-
-    const analysis = engine.analyzeUnnecessary(player.hand, player.melds.length, config.shantenType);
-    const discardMask = this.extendMaskWithRedFives(this.tilesToMask(analysis.tiles));
-    const allowShantenDown = config.enableShantenDown && this.distance(handCounts, handOrigin) + analysis.shanten < shantenOrigin + config.extra;
-    const node = this.addNode(NodePhase.Discard, key, handCounts, wallCounts, {
-      shantenType: analysis.shantenType,
-      shanten: analysis.shanten,
-      actionMask: discardMask,
-      allowTegawari: false,
-      allowShantenDown,
-      forcedDiscardTile
-    }, riichi, config, this.distance(handCounts, handOrigin));
-    caches.discard.set(key, node.id);
 
     for (let tile = 0; tile < 37; tile += 1) {
-      const isDiscard = maskHas(discardMask, tile);
-      if (riichi && forcedDiscardTile !== undefined && tile !== forcedDiscardTile) {
-        continue;
-      }
-      if (riichi && forcedDiscardTile === undefined && !isDiscard) {
-        continue;
-      }
-      if (handCounts[tile] <= 0 || (!allowShantenDown && !isDiscard)) {
+      const isWait = this.maskHasRuntime(node, tile);
+      if (wallCounts[tile] <= 0 || (!node.allowTegawari && !isWait)) {
         continue;
       }
 
-      this.discard(player, handCounts, wallCounts, tile);
       const weight = wallCounts[tile];
-      const sourceId = this.drawNode(config, round, player, engine, caches, handCounts, wallCounts, handOrigin, shantenOrigin, riichi);
-      this.draw(player, handCounts, wallCounts, tile);
-      const scoreBreakdown = analysis.shanten === -1
-        ? this.calcScore(config, round, player, engine, handCounts, wallCounts, analysis.shantenType, tile, riichi)
-        : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+      const callRiichi = context.config.enableRiichi && context.isClosed && node.shanten === 1 && isWait ? true : task.riichi;
+      let targetId: NodeId;
+      let scoreBreakdown: ScoreBreakdown;
 
-      const edgeId = this.findEdge(sourceId, node.id, tile, EdgeKind.Decision);
-      if (edgeId === undefined) {
-        this.addEdge(
-          sourceId,
-          node.id,
-          tile,
-          weight,
-          scoreBreakdown.expectedScore,
-          scoreBreakdown.baseScore,
-          scoreBreakdown.uradoraHitProbability,
-          false,
-          isDiscard,
-          EdgeKind.Decision,
-          riichi,
-          riichi
-        );
+      if (task.riichi && !(node.shanten === 0 && isWait)) {
+        const target = this.ensureDrawNode(context, handCounts, wallCounts, true);
+        targetId = target.nodeId;
+        scoreBreakdown = { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+      } else {
+        const child = this.drawCounts(handCounts, wallCounts, tile);
+        const target = this.ensureDiscardNode(context, child.handCounts, child.wallCounts, callRiichi, task.riichi ? tile : undefined);
+        this.pushNodeTaskIfNew(stack, target, NodePhase.Discard, callRiichi, task.riichi ? tile : undefined);
+        targetId = target.nodeId;
+        if (node.shanten === 0 && isWait) {
+          const childPlayer = this.createPlayerForState(context, child.handCounts);
+          scoreBreakdown = this.calcScore(context.config, context.round, childPlayer, context.engine, child.handCounts, child.wallCounts, node.shantenType, tile, task.riichi);
+        } else {
+          scoreBreakdown = { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+        }
       }
-    }
 
-    return node.id;
+      this.addEdgeIfMissing(
+        node.id,
+        targetId,
+        tile,
+        weight,
+        scoreBreakdown,
+        isWait,
+        false,
+        EdgeKind.Chance,
+        task.riichi,
+        callRiichi
+      );
+    }
+  }
+
+  private expandDiscardNode(context: BuildContext, task: BuildTask, stack: BuildTask[]): void {
+    const node = this.getNode(task.nodeId);
+    if (!node) {
+      return;
+    }
+    const handCounts = node.handCounts;
+    const wallCounts = node.wallCounts;
+
+    for (let tile = 0; tile < 37; tile += 1) {
+      const isDiscard = this.maskHasRuntime(node, tile);
+      if (task.riichi && task.forcedDiscardTile !== undefined && tile !== task.forcedDiscardTile) {
+        continue;
+      }
+      if (task.riichi && task.forcedDiscardTile === undefined && !isDiscard) {
+        continue;
+      }
+      if (handCounts[tile] <= 0 || (!node.allowShantenDown && !isDiscard)) {
+        continue;
+      }
+
+      const child = this.discardCounts(handCounts, wallCounts, tile);
+      const weight = child.wallCounts[tile];
+      const source = this.ensureDrawNode(context, child.handCounts, child.wallCounts, task.riichi);
+      this.pushNodeTaskIfNew(stack, source, NodePhase.Draw, task.riichi);
+      let scoreBreakdown: ScoreBreakdown;
+      if (node.shanten === -1) {
+        const player = this.createPlayerForState(context, handCounts);
+        scoreBreakdown = this.calcScore(context.config, context.round, player, context.engine, handCounts, wallCounts, node.shantenType, tile, task.riichi);
+      } else {
+        scoreBreakdown = { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+      }
+
+      this.addEdgeIfMissing(
+        source.nodeId,
+        node.id,
+        tile,
+        weight,
+        scoreBreakdown,
+        false,
+        isDiscard,
+        EdgeKind.Decision,
+        task.riichi,
+        task.riichi
+      );
+    }
+  }
+
+  private drawCounts(handState: CountRed, wallState: CountRed, tile: number): { handCounts: CountRed; wallCounts: CountRed } {
+    const handCounts = cloneCount(handState);
+    const wallCounts = cloneCount(wallState);
+    handCounts[tile] += 1;
+    wallCounts[tile] -= 1;
+    return { handCounts, wallCounts };
+  }
+
+  private discardCounts(handState: CountRed, wallState: CountRed, tile: number): { handCounts: CountRed; wallCounts: CountRed } {
+    const handCounts = cloneCount(handState);
+    const wallCounts = cloneCount(wallState);
+    handCounts[tile] -= 1;
+    wallCounts[tile] += 1;
+    return { handCounts, wallCounts };
+  }
+
+  private pushNodeTaskIfNew(
+    stack: BuildTask[],
+    result: EnsureNodeResult,
+    phase: NodePhase,
+    riichi: boolean,
+    forcedDiscardTile?: number
+  ): void {
+    if (!result.isNew) {
+      return;
+    }
+    stack.push({
+      phase,
+      nodeId: result.nodeId,
+      riichi,
+      forcedDiscardTile
+    });
+  }
+
+  private addEdgeIfMissing(
+    sourceId: NodeId,
+    targetId: NodeId,
+    tile: number,
+    weight: number,
+    scoreBreakdown: ScoreBreakdown,
+    isWait: boolean,
+    isDiscard: boolean,
+    edgeKind: EdgeKind,
+    riichiBefore: boolean,
+    riichiAfter: boolean
+  ): void {
+    this.addEdge(
+      sourceId,
+      targetId,
+      tile,
+      weight,
+      scoreBreakdown.expectedScore,
+      scoreBreakdown.baseScore,
+      scoreBreakdown.uradoraHitProbability,
+      isWait,
+      isDiscard,
+      edgeKind,
+      riichiBefore,
+      riichiAfter
+    );
   }
 
   private calcStats(config: Config): void {
@@ -794,7 +952,24 @@ export class ExpectedScoreCalculatorTs {
     };
   }
 
-  private createCacheKey(hand: CountRed, wall: CountRed, riichi: boolean, forcedDiscardTile?: number): CacheKey {
+  private createHandCacheKey(hand: CountRed, riichi: boolean, forcedDiscardTile?: number): string {
+    let manzu = 0;
+    let pinzu = 0;
+    let souzu = 0;
+    let honors = 0;
+    for (let tile = 0; tile < 9; tile += 1) {
+      manzu = manzu * 8 + hand[tile];
+      pinzu = pinzu * 8 + hand[tile + 9];
+      souzu = souzu * 8 + hand[tile + 18];
+    }
+    for (let tile = 27; tile < 34; tile += 1) {
+      honors = honors * 8 + hand[tile];
+    }
+    honors += hand[Tile.RedManzu5] * 2097152 + hand[Tile.RedPinzu5] * 4194304 + hand[Tile.RedSouzu5] * 8388608;
+    return `${manzu}|${pinzu}|${souzu}|${honors}|${riichi ? 1 : 0}|${forcedDiscardTile ?? 63}`;
+  }
+
+  private createStateKey(hand: CountRed, wall: CountRed, riichi: boolean, forcedDiscardTile?: number): CacheKey {
     const handKey = this.packCounts(hand);
     const wallKey = this.packCounts(wall);
     const forced = BigInt((forcedDiscardTile ?? 63) & 63);
@@ -817,16 +992,33 @@ export class ExpectedScoreCalculatorTs {
     return counts;
   }
 
-  private unpackCountsForDisplay(packed: CacheKey): Count {
-    return this.decodeForDisplay(this.unpackCounts(packed));
+  private unpackEncodedHandFromStateKey(stateKey: CacheKey): CountRed {
+    return this.unpackCounts(this.asCacheKey(stateKey & COUNT_PACK_MASK));
+  }
+
+  private unpackEncodedWallFromStateKey(stateKey: CacheKey): CountRed {
+    return this.unpackCounts(this.asCacheKey((stateKey >> COUNT_PACK_BITS) & COUNT_PACK_MASK));
   }
 
   private unpackHandFromStateKey(stateKey: CacheKey): Count {
-    return this.unpackCountsForDisplay(this.asCacheKey(stateKey & COUNT_PACK_MASK));
+    return this.decodeForDisplay(this.unpackEncodedHandFromStateKey(stateKey));
   }
 
   private unpackWallFromStateKey(stateKey: CacheKey): Count {
-    return this.unpackCountsForDisplay(this.asCacheKey((stateKey >> COUNT_PACK_BITS) & COUNT_PACK_MASK));
+    return this.decodeForDisplay(this.unpackEncodedWallFromStateKey(stateKey));
+  }
+
+  private createPlayerForState(context: BuildContext, handCounts: CountRed): Player {
+    return {
+      hand: this.decodeForDisplay(handCounts),
+      melds: context.playerMelds.map((meld) => ({
+        type: meld.type,
+        tiles: meld.tiles.slice(),
+        discardedTile: meld.discardedTile,
+        from: meld.from
+      })),
+      wind: context.playerWind
+    };
   }
 
   private countBaseWallTiles(wallCounts: Count): number {
@@ -869,6 +1061,11 @@ export class ExpectedScoreCalculatorTs {
     return this.edges[id];
   }
 
+  private getNodeStateKey(node: InternalSearchNode): CacheKey {
+    node.stateKey ??= this.createStateKey(node.handCounts, node.wallCounts, node.riichi, node.forcedDiscardTile);
+    return node.stateKey;
+  }
+
   private cloneStats(stats: Stat[]): Stat[] {
     return stats.map((stat) => ({
       ...stat,
@@ -890,47 +1087,96 @@ export class ExpectedScoreCalculatorTs {
     return nodes;
   }
 
-  private tilesToMask(tiles: number[]): bigint {
-    let mask = 0n;
+  private analyzeNecessaryMasks(engine: MahjongAnalysisEngine, hand: Count, numMelds: number, type: number): MaskTileAnalysis {
+    const maskEngine = engine as MaskAnalysisEngine;
+    if (maskEngine.analyzeNecessaryMasks) {
+      return maskEngine.analyzeNecessaryMasks(hand, numMelds, type);
+    }
+    const analysis = engine.analyzeNecessary(hand, numMelds, type);
+    const masks = this.tilesToMasks(analysis.tiles);
+    return { shantenType: analysis.shantenType, shanten: analysis.shanten, maskLow: masks.low, maskHigh: masks.high };
+  }
+
+  private analyzeUnnecessaryMasks(engine: MahjongAnalysisEngine, hand: Count, numMelds: number, type: number): MaskTileAnalysis {
+    const maskEngine = engine as MaskAnalysisEngine;
+    if (maskEngine.analyzeUnnecessaryMasks) {
+      return maskEngine.analyzeUnnecessaryMasks(hand, numMelds, type);
+    }
+    const analysis = engine.analyzeUnnecessary(hand, numMelds, type);
+    const masks = this.tilesToMasks(analysis.tiles);
+    return { shantenType: analysis.shantenType, shanten: analysis.shanten, maskLow: masks.low, maskHigh: masks.high };
+  }
+
+  private extendMaskAnalysisWithRedFives(maskLow: number, maskHigh: number): { bigintMask: bigint; low: number; high: number } {
+    let high = maskHigh;
+    if ((maskLow & (1 << Tile.Manzu5)) !== 0) {
+      high |= 1 << (Tile.RedManzu5 - 27);
+    }
+    if ((maskLow & (1 << Tile.Pinzu5)) !== 0) {
+      high |= 1 << (Tile.RedPinzu5 - 27);
+    }
+    if ((maskLow & (1 << Tile.Souzu5)) !== 0) {
+      high |= 1 << (Tile.RedSouzu5 - 27);
+    }
+    return {
+      bigintMask: BigInt(maskLow) | (BigInt(high) << 27n),
+      low: maskLow,
+      high
+    };
+  }
+
+  private tilesToMasks(tiles: number[]): { bigintMask: bigint; low: number; high: number } {
+    let bigintMask = 0n;
+    let low = 0;
+    let high = 0;
     for (const tile of tiles) {
-      mask = addTileToMask(mask, tile);
+      bigintMask = addTileToMask(bigintMask, tile);
+      if (tile < 27) {
+        low |= 1 << tile;
+      } else {
+        high |= 1 << (tile - 27);
+      }
     }
-    return mask;
+    return { bigintMask, low, high };
   }
 
-  private extendMaskWithRedFives(mask: bigint): bigint {
-    let extended = mask;
-    if (maskHas(mask, Tile.Manzu5)) {
-      extended = addTileToMask(extended, Tile.RedManzu5);
+  private extendMasksWithRedFives(masks: { bigintMask: bigint; low: number; high: number }): { bigintMask: bigint; low: number; high: number } {
+    let { bigintMask, low, high } = masks;
+    if ((low & (1 << Tile.Manzu5)) !== 0) {
+      bigintMask = addTileToMask(bigintMask, Tile.RedManzu5);
+      high |= 1 << (Tile.RedManzu5 - 27);
     }
-    if (maskHas(mask, Tile.Pinzu5)) {
-      extended = addTileToMask(extended, Tile.RedPinzu5);
+    if ((low & (1 << Tile.Pinzu5)) !== 0) {
+      bigintMask = addTileToMask(bigintMask, Tile.RedPinzu5);
+      high |= 1 << (Tile.RedPinzu5 - 27);
     }
-    if (maskHas(mask, Tile.Souzu5)) {
-      extended = addTileToMask(extended, Tile.RedSouzu5);
+    if ((low & (1 << Tile.Souzu5)) !== 0) {
+      bigintMask = addTileToMask(bigintMask, Tile.RedSouzu5);
+      high |= 1 << (Tile.RedSouzu5 - 27);
     }
-    return extended;
+    return { bigintMask, low, high };
   }
 
-  private addNode(phase: NodePhase, cacheKey: CacheKey, handCounts: CountRed, wallCounts: CountRed, info: NodeBuildInfo, riichi: boolean, config: Config, originDistance: number): InternalSearchNode {
+  private maskHasRuntime(node: InternalSearchNode, tile: number): boolean {
+    if (tile < 27) {
+      return (node.actionMaskLow & (1 << tile)) !== 0;
+    }
+    return (node.actionMaskHigh & (1 << (tile - 27))) !== 0;
+  }
+
+  private addNode(phase: NodePhase, stateKey: CacheKey | undefined, handCounts: CountRed, wallCounts: CountRed, info: NodeBuildInfo, riichi: boolean, config: Config, originDistance: number): InternalSearchNode {
     const id = this.asNodeId(this.nodeCounter += 1);
-    const tenpaiProb = new Float64Array(config.tMax + 1);
-    const winProb = new Float64Array(config.tMax + 1);
-    const expScore = new Float64Array(config.tMax + 1);
-    if (phase === NodePhase.Discard && info.shanten === 0) {
-      tenpaiProb.fill(1);
-    }
-    if (phase === NodePhase.Discard && info.shanten === -1) {
-      winProb.fill(1);
-    }
     if (phase === NodePhase.Draw) {
-      tenpaiProb[config.tMax] = info.shanten === 0 ? 1 : 0;
+      this.drawNodeCounter += 1;
+    } else {
+      this.discardNodeCounter += 1;
     }
+    const { tenpaiProb, winProb, expScore } = this.createNodeStatArrays(phase, info.shanten, config);
 
     const node: InternalSearchNode = {
       id,
       phase,
-      stateKey: cacheKey,
+      stateKey,
       wallSize: this.countEncodedWallTiles(wallCounts),
       forcedDiscardTile: info.forcedDiscardTile,
       shantenType: info.shantenType,
@@ -940,6 +1186,10 @@ export class ExpectedScoreCalculatorTs {
       allowTegawari: info.allowTegawari,
       allowShantenDown: info.allowShantenDown,
       actionMask: info.actionMask,
+      actionMaskLow: info.actionMaskLow,
+      actionMaskHigh: info.actionMaskHigh,
+      handCounts: cloneCount(handCounts),
+      wallCounts: cloneCount(wallCounts),
       outgoingEdgeIds: [],
       incomingEdgeIds: [],
       tenpaiProb,
@@ -948,6 +1198,52 @@ export class ExpectedScoreCalculatorTs {
     };
     this.nodes[id] = node;
     return node;
+  }
+
+  private createNodeStatArrays(phase: NodePhase, shanten: number, config: Config): { tenpaiProb: Float64Array; winProb: Float64Array; expScore: Float64Array } {
+    const length = config.tMax + 1;
+    if (!config.calcStats) {
+      return {
+        tenpaiProb: phase === NodePhase.Discard && shanten === 0
+          ? this.sharedStatArray(length, "ones")
+          : phase === NodePhase.Draw && shanten === 0
+            ? this.sharedStatArray(length, "draw-tenpai")
+            : this.sharedStatArray(length, "zero"),
+        winProb: phase === NodePhase.Discard && shanten === -1
+          ? this.sharedStatArray(length, "ones")
+          : this.sharedStatArray(length, "zero"),
+        expScore: this.sharedStatArray(length, "zero")
+      };
+    }
+
+    const tenpaiProb = new Float64Array(length);
+    const winProb = new Float64Array(length);
+    const expScore = new Float64Array(length);
+    if (phase === NodePhase.Discard && shanten === 0) {
+      tenpaiProb.fill(1);
+    }
+    if (phase === NodePhase.Discard && shanten === -1) {
+      winProb.fill(1);
+    }
+    if (phase === NodePhase.Draw) {
+      tenpaiProb[config.tMax] = shanten === 0 ? 1 : 0;
+    }
+    return { tenpaiProb, winProb, expScore };
+  }
+
+  private sharedStatArray(length: number, kind: "zero" | "ones" | "draw-tenpai"): Float64Array {
+    const key = `${kind}:${length}`;
+    let array = this.sharedStatArrays.get(key);
+    if (!array) {
+      array = new Float64Array(length);
+      if (kind === "ones") {
+        array.fill(1);
+      } else if (kind === "draw-tenpai") {
+        array[length - 1] = 1;
+      }
+      this.sharedStatArrays.set(key, array);
+    }
+    return array;
   }
 
   private addEdge(
@@ -1054,6 +1350,7 @@ export class ExpectedScoreCalculatorTs {
       .map((nodeId) => this.getNode(nodeId))
       .filter((node): node is InternalSearchNode => Boolean(node))
       .map((node) => {
+        const stateKey = this.getNodeStateKey(node);
         const outgoingEdgeIds = node.outgoingEdgeIds
           .filter((edgeId) => includedEdgeIds.has(edgeId));
         const incomingEdgeIds = node.incomingEdgeIds
@@ -1061,9 +1358,9 @@ export class ExpectedScoreCalculatorTs {
         return {
           id: node.id,
           phase: node.phase,
-          cacheKey: node.stateKey,
-          hand: this.unpackHandFromStateKey(node.stateKey),
-          wall: this.unpackWallFromStateKey(node.stateKey),
+          cacheKey: stateKey,
+          hand: this.decodeForDisplay(node.handCounts),
+          wall: this.decodeForDisplay(node.wallCounts),
           forcedDiscardTile: node.forcedDiscardTile,
           shantenType: node.shantenType,
           shanten: node.shanten,
@@ -1072,6 +1369,8 @@ export class ExpectedScoreCalculatorTs {
           allowTegawari: node.allowTegawari,
           allowShantenDown: node.allowShantenDown,
           actionMask: node.actionMask,
+          actionMaskLow: node.actionMaskLow,
+          actionMaskHigh: node.actionMaskHigh,
           outgoingEdgeIds,
           incomingEdgeIds,
           tenpaiProb: Array.from(node.tenpaiProb),
