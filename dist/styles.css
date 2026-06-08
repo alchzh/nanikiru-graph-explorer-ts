@@ -294,7 +294,7 @@ input {
   display: flex;
   flex-wrap: nowrap;
   gap: 0;
-  overflow-y: visible;
+  overflow-y: hidden;
   overflow-x: auto;
   align-items: flex-start;
   height: 46px;
