@@ -1,5 +1,6 @@
 import { MeldType, ShantenFlag, Tile } from "./constants.js";
 import {
+  CalcMode,
   CalculationResult,
   Config,
   Count,
@@ -15,7 +16,7 @@ import {
   TileOutcome
 } from "./model.js";
 import { createTileImg, createTileText, tileLigature } from "./tileArtwork.js";
-import { countToTileIds, parseTile, tileName, tilesToHand } from "./utils.js";
+import { countToTileIds, isReddora, parseTile, tileName, tilesToHand, toNoReddora } from "./utils.js";
 import type {
   ExpectedScoreCalculationPayload,
   ExpectedScoreWorkerRequest,
@@ -464,6 +465,7 @@ function renderPystyleControlRows(state: AppState, rerender: () => void): HTMLEl
       }
     )),
     renderLabeledControl("Current turn", renderTurnSelect(state, rerender)),
+    renderLabeledControl("Model", renderCalcModeSelect(state, rerender)),
     renderToggleRow(state, rerender)
   );
 
@@ -508,6 +510,27 @@ function renderTurnSelect(state: AppState, rerender: () => void): HTMLElement {
     state.editor.currentTurn = value;
     syncTurnConfig(state.editor);
     state.selectedTurn = value;
+    rerender();
+  });
+  return select;
+}
+
+function renderCalcModeSelect(state: AppState, rerender: () => void): HTMLElement {
+  const select = document.createElement("select");
+  select.className = "turn-select";
+  const modes: Array<{ value: CalcMode; label: string }> = [
+    { value: "improved", label: "Improved" },
+    { value: "reference", label: "Reference (mahjong-cpp)" }
+  ];
+  for (const mode of modes) {
+    const option = document.createElement("option");
+    option.value = mode.value;
+    option.textContent = mode.label;
+    option.selected = mode.value === state.editor.config.calcMode;
+    select.append(option);
+  }
+  select.addEventListener("change", () => {
+    state.editor.config.calcMode = select.value as CalcMode;
     rerender();
   });
   return select;
@@ -1635,7 +1658,13 @@ function scenarioToEditorState(input: ScenarioInput): EditorState {
     doraIndicators: (input.round?.doraIndicators ?? []).map(normalizeTile),
     uradoraIndicators: (input.round?.uradoraIndicators ?? []).map(normalizeTile)
   };
-  const handCount = input.player.hand ? input.player.hand.slice() : tilesToHand(input.player.tiles ?? []);
+  const melds: MeldDraft[] = (input.player.melds ?? []).map((meld) => ({
+    type: meld.type ?? 0,
+    tiles: sortTiles(meld.tiles.map(normalizeTile))
+  }));
+  const handCount = input.player.hand
+    ? input.player.hand.slice()
+    : tilesToHand(input.player.tiles ?? [], melds.length);
   const editorState: EditorState = {
     config,
     currentTurn,
@@ -1644,10 +1673,7 @@ function scenarioToEditorState(input: ScenarioInput): EditorState {
     handTiles: sortTiles(countToTileIds(handCount)),
     doraIndicators: sortTiles(round.doraIndicators.slice()),
     uradoraIndicators: sortTiles(round.uradoraIndicators.slice()),
-    melds: (input.player.melds ?? []).map((meld) => ({
-      type: meld.type ?? 0,
-      tiles: sortTiles(meld.tiles.map(normalizeTile))
-    })),
+    melds,
     currentMeldTiles: [],
     currentMeldType: 0,
     editTarget: "hand",
@@ -1690,18 +1716,23 @@ function syncTurnConfig(editor: EditorState): void {
 }
 
 function createWallFromEditor(editor: EditorState): number[] {
-  const hand = tilesToHand(editor.handTiles);
+  const hand = tilesToHand(editor.handTiles, editor.melds.length);
   const wall = Array.from({ length: 37 }, () => 0);
   const melds = Array.from({ length: 37 }, () => 0);
   const indicators = Array.from({ length: 37 }, () => 0);
 
-  editor.doraIndicators.forEach((tile) => {
-    indicators[tile] += 1;
-  });
+  // A red five takes a copy of its base tile out of the wall as well as its own flag,
+  // matching how ExpectedScoreCalculator.createWall counts them.
+  const countTile = (counts: number[], tile: number): void => {
+    counts[toNoReddora(tile)] += 1;
+    if (isReddora(tile)) {
+      counts[tile] += 1;
+    }
+  };
+
+  editor.doraIndicators.forEach((tile) => countTile(indicators, tile));
   editor.melds.forEach((meld) => {
-    meld.tiles.forEach((tile) => {
-      melds[tile] += 1;
-    });
+    meld.tiles.forEach((tile) => countTile(melds, tile));
   });
 
   for (let tile = 0; tile < 34; tile += 1) {
@@ -1723,7 +1754,7 @@ function getEditableWall(editor: EditorState): number[] {
 
 function buildPlayerFromEditor(editor: EditorState): Player {
   return {
-    hand: tilesToHand(editor.handTiles),
+    hand: tilesToHand(editor.handTiles, editor.melds.length),
     melds: editor.melds.map((meld) => ({
       type: meld.type,
       tiles: meld.tiles.slice(),

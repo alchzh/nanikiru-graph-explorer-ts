@@ -30,6 +30,20 @@ export interface Round {
   uradoraIndicators: number[];
 }
 
+/**
+ * Which expected-score model the calculator evaluates.
+ *
+ * - `"improved"`: riichi locks the hand, so a declared riichi forces tsumogiri on every
+ *   non-winning draw and wins are scored on self-loop chance edges. Draw ("chance") and
+ *   discard ("decision") edges are kept as separate edge sets.
+ * - `"reference"`: a faithful port of mahjong-cpp's `ExpectedScoreCalculator`
+ *   (`src/mahjong/core/expected_score_calculator.cpp`). Every edge is a single draw →
+ *   discard transition read forwards as a draw and backwards as a discard, riichi only
+ *   disables tegawari/shanten-down, and a completed hand emits no discard edges. Results
+ *   match the C++ implementation for the same inputs.
+ */
+export type CalcMode = "improved" | "reference";
+
 export interface Config {
   tMin: number;
   tMax: number;
@@ -42,6 +56,7 @@ export interface Config {
   enableTegawari: boolean;
   enableRiichi: boolean;
   calcStats: boolean;
+  calcMode: CalcMode;
 }
 
 export interface ScoreResult {
@@ -238,7 +253,8 @@ export function createDefaultConfig(): Config {
     enableShantenDown: true,
     enableTegawari: true,
     enableRiichi: true,
-    calcStats: true
+    calcStats: true,
+    calcMode: "improved"
   };
 }
 

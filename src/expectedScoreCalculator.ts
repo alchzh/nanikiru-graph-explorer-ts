@@ -54,6 +54,57 @@ interface CalculationOptions {
   startNode?: Pick<SearchNode, "phase" | "hand" | "wall" | "riichi" | "forcedDiscardTile">;
   originHand?: Count;
   originShanten?: number;
+  /**
+   * Pre-computed candidate sub-graphs (see {@link ExpectedScoreCalculatorTs.calcCandidateSubgraph}).
+   * When supplied, the discard-root build reuses these nodes instead of expanding each
+   * candidate draw subtree itself — this is how the multi-threaded path stitches together
+   * work performed in parallel on separate worker threads.
+   */
+  importedSubgraphs?: SerializedSubgraph[];
+}
+
+/**
+ * A serialized search sub-graph produced by {@link ExpectedScoreCalculatorTs.exportInternalGraph}.
+ * Carries only the node metadata and edge data needed to rebuild the graph; per-turn stat
+ * arrays are intentionally omitted because {@link ExpectedScoreCalculatorTs.calcStats}
+ * re-derives them deterministically from the node/edge structure.
+ */
+export interface SerializedGraphNode {
+  /** `${phase}:${handCacheKey}` — uniquely identifies a search state across sub-graphs. */
+  key: string;
+  phase: NodePhase;
+  handCounts: number[];
+  wallCounts: number[];
+  forcedDiscardTile?: number;
+  shantenType: number;
+  shanten: number;
+  riichi: boolean;
+  originDistance: number;
+  allowTegawari: boolean;
+  allowShantenDown: boolean;
+  actionMask: bigint;
+  actionMaskLow: number;
+  actionMaskHigh: number;
+}
+
+export interface SerializedGraphEdge {
+  sourceKey: string;
+  targetKey: string;
+  tile: number;
+  weight: number;
+  score: number;
+  baseScore: number;
+  uradoraHitProbability: number;
+  isWait: boolean;
+  isDiscard: boolean;
+  edgeKind: EdgeKind;
+  riichiBefore: boolean;
+  riichiAfter: boolean;
+}
+
+export interface SerializedSubgraph {
+  nodes: SerializedGraphNode[];
+  edges: SerializedGraphEdge[];
 }
 
 interface ScoreBreakdown {
@@ -178,6 +229,12 @@ export class ExpectedScoreCalculatorTs {
   private readonly warnings: string[] = [];
   private readonly drawTileAggregateCache = new Map<number, InternalTileBreakdown[]>();
   private readonly sharedStatArrays = new Map<string, Float64Array>();
+  /**
+   * True while evaluating {@link Config.calcMode} `"reference"`, the faithful port of
+   * mahjong-cpp's `ExpectedScoreCalculator`. Set by every public entry point before any
+   * graph work; see {@link expandDrawNodeReference} for how the two models differ.
+   */
+  private referenceMode = false;
   private drawCacheHits = 0;
   private discardCacheHits = 0;
   private nodeCounter = 0;
@@ -194,20 +251,11 @@ export class ExpectedScoreCalculatorTs {
     wallInput?: Count,
     options: CalculationOptions = {}
   ): CalculationResult {
-    this.nodes.length = 0;
-    this.edges.length = 0;
-    this.warnings.length = 0;
-    this.drawTileAggregateCache.clear();
-    this.drawCacheHits = 0;
-    this.discardCacheHits = 0;
-    this.nodeCounter = 0;
-    this.edgeCounter = 0;
-    this.drawNodeCounter = 0;
-    this.discardNodeCounter = 0;
-    this.lastSnapshotState = undefined;
+    this.resetState();
 
     const graphDepthLimit = Math.max(0, options.graphDepthLimit ?? 2);
     const config: Config = { ...configInput };
+    this.referenceMode = config.calcMode === "reference";
     const player = clonePlayer(playerInput);
     if (options.startNode) {
       player.hand = cloneCount(options.startNode.hand);
@@ -236,8 +284,15 @@ export class ExpectedScoreCalculatorTs {
         config.shantenType
       ).shanten;
     const numTiles = numPlayerTiles(player) + player.melds.length * 3;
-    const riichi = options.startNode?.riichi ?? (config.enableRiichi && isClosed(player) && shantenOrigin <= 0);
+    // Reference mode always enters the graph un-riichi (mahjong-cpp calls
+    // `draw_node(false)` / `discard_node(false)`); riichi is declared later, inside the
+    // discard expansion, on the tenpai discard itself.
+    const riichi = options.startNode?.riichi
+      ?? (!this.referenceMode && config.enableRiichi && isClosed(player) && shantenOrigin <= 0);
     const caches: CacheState = { draw: new Map(), discard: new Map() };
+    if (options.importedSubgraphs && options.importedSubgraphs.length > 0) {
+      this.seedImportedGraph(config, caches, options.importedSubgraphs);
+    }
     const stats: Stat[] = [];
     let rootNodeId: NodeId | undefined;
     let rootPhase: NodePhase | undefined;
@@ -298,12 +353,27 @@ export class ExpectedScoreCalculatorTs {
         this.calcStats(config);
       }
 
+      // Which draw node a candidate discard leads to depends on whether that discard
+      // declares riichi. Reference mode re-derives the declaration per tile exactly as
+      // mahjong-cpp's `calc_discard_hand` does; improved mode carries the root's flag.
+      const rootDiscard = this.referenceMode
+        ? this.analyzeUnnecessaryMasks(engine, player.hand, player.melds.length, config.shantenType)
+        : undefined;
+      const rootDiscardMask = rootDiscard
+        ? this.extendMaskAnalysisWithRedFives(rootDiscard.maskLow, rootDiscard.maskHigh)
+        : undefined;
+      const playerIsClosed = isClosed(player);
+
       for (let tile = 0; tile < 37; tile += 1) {
         if (handCounts[tile] <= 0) {
           continue;
         }
+        const statRiichi = rootDiscard && rootDiscardMask
+          ? config.enableRiichi && playerIsClosed && rootDiscard.shanten === 0
+            && this.maskHasBits(rootDiscardMask.low, rootDiscardMask.high, tile)
+          : riichi;
         this.discard(player, handCounts, wallCounts, tile);
-        const nodeId = caches.draw.get(this.createHandCacheKey(handCounts, riichi));
+        const nodeId = caches.draw.get(this.createHandCacheKey(handCounts, statRiichi));
         if (nodeId !== undefined) {
           const node = this.getNode(nodeId)!;
           const necessary = this.getNecessaryTiles(config, player, wall, engine);
@@ -367,6 +437,9 @@ export class ExpectedScoreCalculatorTs {
     if (!root) {
       throw new Error(`Graph node is not available in the cached calculation: ${rootNodeId}`);
     }
+    // The cached graph was built in whichever mode produced it; snapshotting must read it
+    // back the same way (this instance may have served another mode in between).
+    this.referenceMode = this.lastSnapshotState.config.calcMode === "reference";
 
     const depthLimit = Math.max(0, graphDepthLimit ?? this.lastSnapshotState.context.graphDepthLimit);
     const snapshot = this.createGraphSnapshot(
@@ -389,6 +462,263 @@ export class ExpectedScoreCalculatorTs {
         graphDepthLimit: depthLimit
       }
     };
+  }
+
+  /**
+   * Plan how a 14-tile discard analysis can be split into independent per-discard sub-tasks.
+   * Returns the list of candidate discard tiles (encoded, red-fives separate) that the
+   * discard-root expansion would visit, or `null` when the input is not a discard analysis
+   * (in which case the caller should fall back to a single-threaded {@link calc}). The returned
+   * candidate set mirrors the filtering performed by {@link expandDiscardNode} for the root node.
+   */
+  planDiscardCandidates(
+    configInput: Config,
+    round: Round,
+    playerInput: Player,
+    engine: MahjongAnalysisEngine,
+    wallInput?: Count
+  ): { candidates: number[]; riichi: boolean } | null {
+    const config: Config = { ...configInput };
+    this.referenceMode = config.calcMode === "reference";
+    const player = clonePlayer(playerInput);
+    const numTiles = numPlayerTiles(player) + player.melds.length * 3;
+    if (numTiles !== 14) {
+      return null;
+    }
+    const wall = wallInput
+      ? cloneCount(wallInput)
+      : this.createWall(round, playerInput, config.enableReddora);
+    if (config.sum === 0) {
+      config.sum = this.countBaseWallTiles(wall);
+    }
+    const handCounts = this.encode(player.hand, config.enableReddora);
+    const shantenOrigin = engine.calculateShanten(player.hand, player.melds.length, config.shantenType).shanten;
+    const riichi = !this.referenceMode && config.enableRiichi && isClosed(player) && shantenOrigin <= 0;
+    const analysis = this.analyzeUnnecessaryMasks(engine, this.decodeForDisplay(handCounts), player.melds.length, config.shantenType);
+    const mask = this.extendMaskAnalysisWithRedFives(analysis.maskLow, analysis.maskHigh);
+    // originDistance is 0 at the root, so this matches ensureDiscardNode's allowShantenDown.
+    const allowShantenDown = config.enableShantenDown
+      && (!this.referenceMode || (!riichi && analysis.shanten >= 0))
+      && analysis.shanten < shantenOrigin + config.extra;
+
+    const candidates: number[] = [];
+    for (let tile = 0; tile < 37; tile += 1) {
+      const isDiscard = this.maskHasBits(mask.low, mask.high, tile);
+      // Top-level discard root never has a forced discard, so only the riichi
+      // "no shanten-down" guard from expandDiscardNode applies here.
+      if (riichi && !isDiscard) {
+        continue;
+      }
+      if (handCounts[tile] <= 0 || (!allowShantenDown && !isDiscard)) {
+        continue;
+      }
+      candidates.push(tile);
+    }
+    return { candidates, riichi };
+  }
+
+  /**
+   * Build the search subtree rooted at the draw node reached by discarding `discardTile`
+   * from the 14-tile hand, and return it serialized. This reproduces exactly the candidate
+   * draw node (and its descendants) that the monolithic discard-root build would have created
+   * for that tile, allowing the work to be performed on a separate thread and later stitched
+   * back in via {@link calc}'s `importedSubgraphs` option.
+   */
+  calcCandidateSubgraph(
+    configInput: Config,
+    round: Round,
+    playerInput: Player,
+    engine: MahjongAnalysisEngine,
+    wallInput: Count | undefined,
+    discardTile: number
+  ): SerializedSubgraph {
+    this.resetState();
+    const config: Config = { ...configInput };
+    this.referenceMode = config.calcMode === "reference";
+    const player = clonePlayer(playerInput);
+    const wall = wallInput
+      ? cloneCount(wallInput)
+      : this.createWall(round, playerInput, config.enableReddora);
+    if (config.sum === 0) {
+      config.sum = this.countBaseWallTiles(wall);
+    }
+    const handCounts = this.encode(player.hand, config.enableReddora);
+    const wallCounts = this.encode(wall, config.enableReddora);
+    const handOrigin = cloneCount(handCounts);
+    const shantenOrigin = engine.calculateShanten(player.hand, player.melds.length, config.shantenType).shanten;
+    let riichi = !this.referenceMode && config.enableRiichi && isClosed(player) && shantenOrigin <= 0;
+    if (this.referenceMode) {
+      // Mirror the root discard expansion: this candidate declares riichi when it is a
+      // shanten-preserving discard from a closed tenpai hand.
+      const rootDiscard = this.analyzeUnnecessaryMasks(engine, player.hand, player.melds.length, config.shantenType);
+      const rootMask = this.extendMaskAnalysisWithRedFives(rootDiscard.maskLow, rootDiscard.maskHigh);
+      riichi = config.enableRiichi && isClosed(player) && rootDiscard.shanten === 0
+        && this.maskHasBits(rootMask.low, rootMask.high, discardTile);
+    }
+    const caches: CacheState = { draw: new Map(), discard: new Map() };
+
+    this.discard(player, handCounts, wallCounts, discardTile);
+    this.buildNodeGraph(
+      config,
+      round,
+      player,
+      engine,
+      caches,
+      handCounts,
+      wallCounts,
+      handOrigin,
+      shantenOrigin,
+      NodePhase.Draw,
+      riichi
+    );
+    return this.exportInternalGraph();
+  }
+
+  /** Serialize the currently-built graph so it can be transferred to another thread. */
+  exportInternalGraph(): SerializedSubgraph {
+    const idToKey = new Map<NodeId, string>();
+    const nodes: SerializedGraphNode[] = [];
+    for (const node of this.allNodes()) {
+      const key = this.nodeDedupKey(node);
+      idToKey.set(node.id, key);
+      nodes.push({
+        key,
+        phase: node.phase,
+        handCounts: node.handCounts.slice(),
+        wallCounts: node.wallCounts.slice(),
+        forcedDiscardTile: node.forcedDiscardTile,
+        shantenType: node.shantenType,
+        shanten: node.shanten,
+        riichi: node.riichi,
+        originDistance: node.originDistance,
+        allowTegawari: node.allowTegawari,
+        allowShantenDown: node.allowShantenDown,
+        actionMask: node.actionMask,
+        actionMaskLow: node.actionMaskLow,
+        actionMaskHigh: node.actionMaskHigh
+      });
+    }
+
+    const edges: SerializedGraphEdge[] = [];
+    for (let id = 1; id < this.edges.length; id += 1) {
+      const edge = this.edges[this.asEdgeId(id)];
+      if (!edge) {
+        continue;
+      }
+      edges.push({
+        sourceKey: idToKey.get(edge.sourceId)!,
+        targetKey: idToKey.get(edge.targetId)!,
+        tile: edge.tile,
+        weight: edge.weight,
+        score: edge.score,
+        baseScore: edge.baseScore,
+        uradoraHitProbability: edge.uradoraHitProbability,
+        isWait: edge.isWait,
+        isDiscard: edge.isDiscard,
+        edgeKind: edge.edgeKind,
+        riichiBefore: edge.riichiBefore,
+        riichiAfter: edge.riichiAfter
+      });
+    }
+
+    return { nodes, edges };
+  }
+
+  private nodeDedupKey(node: InternalSearchNode): string {
+    return `${node.phase}:${this.createHandCacheKey(node.handCounts, node.riichi, node.forcedDiscardTile)}`;
+  }
+
+  /**
+   * Merge pre-computed candidate sub-graphs into the (freshly reset) graph, de-duplicating
+   * shared search states by their {@link nodeDedupKey}. After seeding, a discard-root build
+   * reuses these nodes as cache hits rather than re-expanding them. Stat arrays are left at
+   * their initial values; {@link calcStats} re-derives the induction over the merged graph.
+   */
+  private seedImportedGraph(config: Config, caches: CacheState, subgraphs: SerializedSubgraph[]): void {
+    const keyToId = new Map<string, NodeId>();
+    for (const subgraph of subgraphs) {
+      for (const imported of subgraph.nodes) {
+        if (keyToId.has(imported.key)) {
+          continue;
+        }
+        const node = this.addNode(
+          imported.phase,
+          undefined,
+          imported.handCounts,
+          imported.wallCounts,
+          {
+            shantenType: imported.shantenType,
+            shanten: imported.shanten,
+            actionMask: imported.actionMask,
+            actionMaskLow: imported.actionMaskLow,
+            actionMaskHigh: imported.actionMaskHigh,
+            allowTegawari: imported.allowTegawari,
+            allowShantenDown: imported.allowShantenDown,
+            forcedDiscardTile: imported.forcedDiscardTile
+          },
+          imported.riichi,
+          config,
+          imported.originDistance
+        );
+        keyToId.set(imported.key, node.id);
+        const handKey = this.createHandCacheKey(imported.handCounts, imported.riichi, imported.forcedDiscardTile);
+        if (imported.phase === NodePhase.Draw) {
+          caches.draw.set(handKey, node.id);
+        } else {
+          caches.discard.set(handKey, node.id);
+        }
+      }
+    }
+
+    const seenEdges = new Set<string>();
+    for (const subgraph of subgraphs) {
+      for (const edge of subgraph.edges) {
+        const sourceId = keyToId.get(edge.sourceKey);
+        const targetId = keyToId.get(edge.targetKey);
+        if (sourceId === undefined || targetId === undefined) {
+          continue;
+        }
+        // Reference mode has one edge per vertex pair, and two sub-graphs may have
+        // produced it from opposite ends (one as a draw, one as a discard) and so tagged
+        // it with different kinds. De-duplicate on the pair alone there, matching
+        // hasEdgeBetween; improved mode keeps both kinds as genuinely distinct edges.
+        const edgeKey = this.referenceMode
+          ? `${sourceId}|${targetId}`
+          : `${sourceId}|${targetId}|${edge.tile}|${edge.edgeKind}`;
+        if (seenEdges.has(edgeKey)) {
+          continue;
+        }
+        seenEdges.add(edgeKey);
+        this.addEdge(
+          sourceId,
+          targetId,
+          edge.tile,
+          edge.weight,
+          edge.score,
+          edge.baseScore,
+          edge.uradoraHitProbability,
+          edge.isWait,
+          edge.isDiscard,
+          edge.edgeKind,
+          edge.riichiBefore,
+          edge.riichiAfter
+        );
+      }
+    }
+  }
+
+  private resetState(): void {
+    this.nodes.length = 0;
+    this.edges.length = 0;
+    this.warnings.length = 0;
+    this.drawTileAggregateCache.clear();
+    this.drawCacheHits = 0;
+    this.discardCacheHits = 0;
+    this.nodeCounter = 0;
+    this.edgeCounter = 0;
+    this.drawNodeCounter = 0;
+    this.discardNodeCounter = 0;
+    this.lastSnapshotState = undefined;
   }
 
   createWall(round: Round, player: Player, enableReddora: boolean): Count {
@@ -526,7 +856,13 @@ export class ExpectedScoreCalculatorTs {
       }
     }
 
+    // The uradora indicators are drawn from the wall as it stands at the winning hand, so
+    // the denominator is that wall's size, not the constant starting wall size.
+    const wallSize = this.countBaseWallTiles(wall);
+
     if (numIndicators === 1) {
+      // One indicator can add at most four han (four copies of the tile it points at),
+      // so the 0..4 range is exhaustive here — no need for the full table below.
       const upScores = engine.scoring.getUpScores(round, player, result, winFlag, 4);
       const numIndicatorCounts = Array.from({ length: 5 }, () => 0);
       for (let tile = 0; tile < 34; tile += 1) {
@@ -536,16 +872,19 @@ export class ExpectedScoreCalculatorTs {
 
       let score = 0;
       for (let i = 0; i <= 4; i += 1) {
-        score += upScores[i] * (numIndicatorCounts[i] / config.sum);
+        score += upScores[i] * (numIndicatorCounts[i] / wallSize);
       }
-      const uradoraHitProbability = config.sum > 0 ? 1 - (numIndicatorCounts[0] / config.sum) : 0;
+      const uradoraHitProbability = wallSize > 0 ? 1 - (numIndicatorCounts[0] / wallSize) : 0;
       return { expectedScore: score, baseScore, uradoraHitProbability };
     }
 
-    const maxAddedHanPerIndicator = Array.from({ length: 34 }, (_, tile) => handAndMelds[TO_DORA[tile]]);
-    const maxAddedHan = maxAddedHanPerIndicator.sort((left, right) => right - left).slice(0, numIndicators).reduce((sum, value) => sum + value, 0);
-    const upScores = engine.scoring.getUpScores(round, player, result, winFlag, maxAddedHan);
-    const distribution = this.exactUradoraDistribution(wall, handAndMelds, config.sum, numIndicators);
+    // Ask for the whole 0..12 range the score table covers rather than trying to bound the
+    // added han: the same indicator can be drawn several times, so a bound taken from the
+    // top `numIndicators` per-indicator gains under-estimates (four copies of one indicator
+    // beat the four largest distinct gains), and under-estimating silently clamps the
+    // high-han scores. 12 is where the distribution saturates anyway.
+    const upScores = engine.scoring.getUpScores(round, player, result, winFlag, 12);
+    const distribution = this.exactUradoraDistribution(wall, handAndMelds, wallSize, numIndicators);
     let score = 0;
     let uradoraHitProbability = 0;
     for (const [addedHan, probability] of distribution.entries()) {
@@ -605,7 +944,13 @@ export class ExpectedScoreCalculatorTs {
     while (stack.length > 0) {
       const task = stack.pop()!;
       if (task.phase === NodePhase.Draw) {
-        this.expandDrawNode(context, task, stack);
+        if (this.referenceMode) {
+          this.expandDrawNodeReference(context, task, stack);
+        } else {
+          this.expandDrawNode(context, task, stack);
+        }
+      } else if (this.referenceMode) {
+        this.expandDiscardNodeReference(context, task, stack);
       } else {
         this.expandDiscardNode(context, task, stack);
       }
@@ -652,7 +997,11 @@ export class ExpectedScoreCalculatorTs {
     const analysis = this.analyzeUnnecessaryMasks(context.engine, hand, context.numMelds, context.config.shantenType);
     const discardMask = this.extendMaskAnalysisWithRedFives(analysis.maskLow, analysis.maskHigh);
     const originDistance = this.distance(handCounts, context.handOrigin);
-    const allowShantenDown = context.config.enableShantenDown && originDistance + analysis.shanten < context.shantenOrigin + context.config.extra;
+    // Reference mode additionally refuses shanten-down under riichi (the hand is locked)
+    // and for a completed hand, where the only legal discard is the tile just drawn.
+    const allowShantenDown = context.config.enableShantenDown
+      && (!this.referenceMode || (!riichi && analysis.shanten >= 0))
+      && originDistance + analysis.shanten < context.shantenOrigin + context.config.extra;
     const node = this.addNode(NodePhase.Discard, undefined, handCounts, wallCounts, {
       shantenType: analysis.shantenType,
       shanten: analysis.shanten,
@@ -805,6 +1154,145 @@ export class ExpectedScoreCalculatorTs {
     }
   }
 
+  /**
+   * Reference-mode draw expansion — a port of `GraphBuilder::draw_node` in
+   * mahjong-cpp's `expected_score_calculator.cpp`.
+   *
+   * Unlike {@link expandDrawNode}, a riichi hand is not special-cased here: riichi only
+   * clears `allowTegawari`, which already restricts the loop to winning tiles once the
+   * hand is tenpai. Every transition is a single draw → discard edge; the same edge is
+   * read backwards by the target discard node as "discard this tile", so it is added at
+   * most once per (source, target) pair no matter which expansion reaches it first.
+   */
+  private expandDrawNodeReference(context: BuildContext, task: BuildTask, stack: BuildTask[]): void {
+    const node = this.getNode(task.nodeId);
+    if (!node) {
+      return;
+    }
+    const handCounts = node.handCounts;
+    const wallCounts = node.wallCounts;
+
+    for (let tile = 0; tile < 37; tile += 1) {
+      const isWait = this.maskHasRuntime(node, tile);
+      if (wallCounts[tile] <= 0 || (!node.allowTegawari && !isWait)) {
+        continue;
+      }
+
+      const weight = wallCounts[tile];
+      const child = this.drawCounts(handCounts, wallCounts, tile);
+      const target = this.ensureDiscardNode(context, child.handCounts, child.wallCounts, task.riichi);
+      this.pushNodeTaskIfNew(stack, target, NodePhase.Discard, task.riichi);
+      if (this.hasEdgeBetween(node.id, target.nodeId)) {
+        continue;
+      }
+
+      // Already tenpai before the draw, so a wait tile completes the hand: score it.
+      const scoreBreakdown = node.shanten === 0 && isWait
+        ? this.calcScore(
+            context.config,
+            context.round,
+            this.createPlayerForState(context, child.handCounts),
+            context.engine,
+            child.handCounts,
+            child.wallCounts,
+            node.shantenType,
+            tile,
+            task.riichi
+          )
+        : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+
+      this.addEdgeIfMissing(
+        node.id,
+        target.nodeId,
+        tile,
+        weight,
+        scoreBreakdown,
+        isWait,
+        false,
+        EdgeKind.Chance,
+        task.riichi,
+        task.riichi
+      );
+    }
+  }
+
+  /**
+   * Reference-mode discard expansion — a port of `GraphBuilder::discard_node` in
+   * mahjong-cpp's `expected_score_calculator.cpp`.
+   *
+   * Riichi is declared here, on the discard itself, whenever a closed hand discards a
+   * shanten-preserving tile from tenpai. A completed hand (shanten -1) has an empty
+   * discard mask and no shanten-down, so it emits nothing: its win is scored on the
+   * incoming draw edge, and the value of declining that tsumo is supplied by the source
+   * tenpai node.
+   */
+  private expandDiscardNodeReference(context: BuildContext, task: BuildTask, stack: BuildTask[]): void {
+    const node = this.getNode(task.nodeId);
+    if (!node) {
+      return;
+    }
+    const handCounts = node.handCounts;
+    const wallCounts = node.wallCounts;
+
+    for (let tile = 0; tile < 37; tile += 1) {
+      const isDiscard = this.maskHasRuntime(node, tile);
+      if (handCounts[tile] <= 0 || (!node.allowShantenDown && !isDiscard)) {
+        continue;
+      }
+
+      const callRiichi = task.riichi
+        || (context.config.enableRiichi && context.isClosed && node.shanten === 0 && isDiscard);
+      const child = this.discardCounts(handCounts, wallCounts, tile);
+      const weight = child.wallCounts[tile];
+      const source = this.ensureDrawNode(context, child.handCounts, child.wallCounts, callRiichi);
+      this.pushNodeTaskIfNew(stack, source, NodePhase.Draw, callRiichi);
+      if (this.hasEdgeBetween(source.nodeId, node.id)) {
+        continue;
+      }
+
+      const scoreBreakdown = node.shanten === -1
+        ? this.calcScore(
+            context.config,
+            context.round,
+            this.createPlayerForState(context, handCounts),
+            context.engine,
+            handCounts,
+            wallCounts,
+            node.shantenType,
+            tile,
+            task.riichi
+          )
+        : { expectedScore: 0, baseScore: 0, uradoraHitProbability: 0 };
+
+      this.addEdgeIfMissing(
+        source.nodeId,
+        node.id,
+        tile,
+        weight,
+        scoreBreakdown,
+        false,
+        isDiscard,
+        EdgeKind.Decision,
+        task.riichi,
+        callRiichi
+      );
+    }
+  }
+
+  /**
+   * Reference-mode edge de-duplication, matching mahjong-cpp's `Graph::has_edge`, which
+   * keys on the vertex pair alone. Tile identity is implied: the target hand is the
+   * source hand plus exactly one tile, so a (source, target) pair fixes the tile.
+   */
+  private hasEdgeBetween(sourceId: NodeId, targetId: NodeId): boolean {
+    for (const edgeId of this.getNode(sourceId)?.outgoingEdgeIds ?? []) {
+      if (this.getEdge(edgeId)?.targetId === targetId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private drawCounts(handState: CountRed, wallState: CountRed, tile: number): { handCounts: CountRed; wallCounts: CountRed } {
     const handCounts = cloneCount(handState);
     const wallCounts = cloneCount(wallState);
@@ -868,6 +1356,11 @@ export class ExpectedScoreCalculatorTs {
   }
 
   private calcStats(config: Config): void {
+    if (this.referenceMode) {
+      this.calcStatsReference(config);
+      return;
+    }
+
     const allNodes = this.allNodes();
     const drawNodes = allNodes.filter((node) => node.phase === NodePhase.Draw);
     const discardNodes = allNodes.filter((node) => node.phase === NodePhase.Discard);
@@ -939,6 +1432,85 @@ export class ExpectedScoreCalculatorTs {
           if (source.expScore[turn] > bestExpScore) {
             bestExpScore = source.expScore[turn];
             bestExpScoreTile = edge.tile;
+          }
+        }
+
+        node.tenpaiProb[turn] = bestTenpai;
+        node.winProb[turn] = bestWin;
+        node.expScore[turn] = bestExpScore;
+      }
+    }
+  }
+
+  /**
+   * Reference-mode backward induction — a port of `ExpectedScoreCalculator::calc_stats`.
+   *
+   * Draw nodes average over their outgoing draw edges; an edge whose score is positive is
+   * an agari, so it contributes certainty (tenpai and win probability 1) and at least its
+   * score. Discard nodes take the best value over the draw nodes feeding them, from a
+   * floor of zero. A completed hand emits no discard edges, so its only incoming edge is
+   * the scored draw that produced it: it inherits that tenpai hand's value, which is what
+   * makes `max(edge.score, target.expScore)` read as "take the tsumo, or decline it and
+   * keep waiting on this hand".
+   */
+  private calcStatsReference(config: Config): void {
+    const allNodes = this.allNodes();
+    const drawNodes = allNodes.filter((node) => node.phase === NodePhase.Draw);
+    const discardNodes = allNodes.filter((node) => node.phase === NodePhase.Discard);
+
+    for (let turn = config.tMax; turn >= config.tMin; turn -= 1) {
+      // At tMax there is no draw left; a tenpai draw node keeps the tenpai flag it was
+      // seeded with in createNodeStatArrays and everything else stays zero.
+      if (turn < config.tMax) {
+        for (const node of drawNodes) {
+          const previousTenpai = node.tenpaiProb[turn + 1];
+          const previousWin = node.winProb[turn + 1];
+          const previousExpScore = node.expScore[turn + 1];
+          const denominator = config.sum - turn;
+          let tenpaiAccum = 0;
+          let winAccum = 0;
+          let expAccum = 0;
+
+          for (const edgeId of node.outgoingEdgeIds) {
+            const edge = this.getEdge(edgeId)!;
+            const target = this.getNode(edge.targetId)!;
+            let tenpai = target.tenpaiProb[turn + 1];
+            let win = target.winProb[turn + 1];
+            let expScore = target.expScore[turn + 1];
+            if (edge.score > 0) {
+              tenpai = 1;
+              win = 1;
+              expScore = Math.max(edge.score, expScore);
+            }
+            tenpaiAccum += edge.weight * (tenpai - previousTenpai);
+            winAccum += edge.weight * (win - previousWin);
+            expAccum += edge.weight * (expScore - previousExpScore);
+          }
+
+          node.tenpaiProb[turn] = node.shanten === 0
+            ? 1
+            : previousTenpai + (denominator > 0 ? tenpaiAccum / denominator : 0);
+          node.winProb[turn] = previousWin + (denominator > 0 ? winAccum / denominator : 0);
+          node.expScore[turn] = previousExpScore + (denominator > 0 ? expAccum / denominator : 0);
+        }
+      }
+
+      for (const node of discardNodes) {
+        let bestTenpai = 0;
+        let bestWin = 0;
+        let bestExpScore = 0;
+
+        for (const edgeId of node.incomingEdgeIds) {
+          const edge = this.getEdge(edgeId)!;
+          const source = this.getNode(edge.sourceId)!;
+          if (source.tenpaiProb[turn] > bestTenpai) {
+            bestTenpai = source.tenpaiProb[turn];
+          }
+          if (source.winProb[turn] > bestWin) {
+            bestWin = source.winProb[turn];
+          }
+          if (source.expScore[turn] > bestExpScore) {
+            bestExpScore = source.expScore[turn];
           }
         }
 
@@ -1163,10 +1735,27 @@ export class ExpectedScoreCalculatorTs {
   }
 
   private maskHasRuntime(node: InternalSearchNode, tile: number): boolean {
+    return this.maskHasBits(node.actionMaskLow, node.actionMaskHigh, tile);
+  }
+
+  private maskHasBits(maskLow: number, maskHigh: number, tile: number): boolean {
     if (tile < 27) {
-      return (node.actionMaskLow & (1 << tile)) !== 0;
+      return (maskLow & (1 << tile)) !== 0;
     }
-    return (node.actionMaskHigh & (1 << (tile - 27))) !== 0;
+    return (maskHigh & (1 << (tile - 27))) !== 0;
+  }
+
+  /**
+   * In reference mode a single edge set does double duty: every edge runs from a draw
+   * node to a discard node, read forwards as a draw and backwards as a discard. The
+   * traversal direction alone identifies the role, so no edge is ever filtered out.
+   */
+  private isChanceEdge(edge: InternalSearchEdge | undefined): boolean {
+    return edge !== undefined && (this.referenceMode || edge.edgeKind === EdgeKind.Chance);
+  }
+
+  private isDecisionEdge(edge: InternalSearchEdge | undefined): boolean {
+    return edge !== undefined && (this.referenceMode || edge.edgeKind === EdgeKind.Decision);
   }
 
   private addNode(phase: NodePhase, stateKey: CacheKey | undefined, handCounts: CountRed, wallCounts: CountRed, info: NodeBuildInfo, riichi: boolean, config: Config, originDistance: number): InternalSearchNode {
@@ -1207,6 +1796,24 @@ export class ExpectedScoreCalculatorTs {
 
   private createNodeStatArrays(phase: NodePhase, shanten: number, config: Config): { tenpaiProb: Float64Array; winProb: Float64Array; expScore: Float64Array } {
     const length = config.tMax + 1;
+    // mahjong-cpp seeds every vertex at zero and lets calc_stats derive discard-node
+    // values purely from their sources, so reference mode skips the discard prefills.
+    if (this.referenceMode) {
+      const drawTenpai = phase === NodePhase.Draw && shanten === 0;
+      if (!config.calcStats) {
+        return {
+          tenpaiProb: this.sharedStatArray(length, drawTenpai ? "draw-tenpai" : "zero"),
+          winProb: this.sharedStatArray(length, "zero"),
+          expScore: this.sharedStatArray(length, "zero")
+        };
+      }
+      const tenpaiProb = new Float64Array(length);
+      if (drawTenpai) {
+        tenpaiProb[config.tMax] = 1;
+      }
+      return { tenpaiProb, winProb: new Float64Array(length), expScore: new Float64Array(length) };
+    }
+
     if (!config.calcStats) {
       return {
         tenpaiProb: phase === NodePhase.Discard && shanten === 0
@@ -1329,8 +1936,8 @@ export class ExpectedScoreCalculatorTs {
         continue;
       }
       const branchEdgeIds = node.phase === NodePhase.Draw
-        ? node.outgoingEdgeIds.filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Chance)
-        : node.incomingEdgeIds.filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Decision);
+        ? node.outgoingEdgeIds.filter((edgeId) => this.isChanceEdge(this.getEdge(edgeId)))
+        : node.incomingEdgeIds.filter((edgeId) => this.isDecisionEdge(this.getEdge(edgeId)));
       branchEdgeIds.forEach((edgeId) => {
         const edge = this.getEdge(edgeId);
         if (!edge) {
@@ -1407,15 +2014,21 @@ export class ExpectedScoreCalculatorTs {
         const previousExpScore = node.expScore[turn + 1] ?? 0;
         const denominator = config.sum - turn;
         const chanceBranches = node.outgoingEdgeIds
-          .filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Chance)
+          .filter((edgeId) => this.isChanceEdge(this.getEdge(edgeId)))
           .map((edgeId) => {
             const edge = this.getEdge(edgeId)!;
             const target = this.getNode(edge.targetId)!;
             const realizedExpScore = Math.max(edge.score, target.expScore[turn + 1] ?? 0);
-            // A winning draw reaches an agari state (win probability 1); in riichi
-            // mode this is a self-loop edge whose target winProb is not 1, so read
-            // the win directly. Mirrors the winProb induction in calcStats().
-            const targetWin = node.shanten === 0 && edge.isWait ? 1 : (target.winProb[turn + 1] ?? 0);
+            // A winning draw reaches an agari state (tenpai and win probability 1).
+            // Improved mode models it as a self-loop edge and reference mode as an edge
+            // into an unreachable completed-hand node, so in neither case does the
+            // target's own probability say 1 — read it off the edge instead. Mirrors the
+            // inductions in calcStats() / calcStatsReference().
+            const isAgari = this.referenceMode
+              ? edge.score > 0
+              : node.shanten === 0 && edge.isWait;
+            const targetWin = isAgari ? 1 : (target.winProb[turn + 1] ?? 0);
+            const targetTenpai = this.referenceMode && isAgari ? 1 : (target.tenpaiProb[turn + 1] ?? 0);
             return {
               tile: edge.tile,
               targetNodeId: target.id,
@@ -1424,10 +2037,10 @@ export class ExpectedScoreCalculatorTs {
               immediateScore: edge.score,
               baseScore: edge.baseScore,
               uradoraHitProbability: edge.uradoraHitProbability,
-              targetTenpai: target.tenpaiProb[turn + 1] ?? 0,
+              targetTenpai,
               targetWin,
               targetExpScore: target.expScore[turn + 1] ?? 0,
-              contributionTenpai: denominator > 0 ? edge.weight * ((target.tenpaiProb[turn + 1] ?? 0) - previousTenpai) / denominator : 0,
+              contributionTenpai: denominator > 0 ? edge.weight * (targetTenpai - previousTenpai) / denominator : 0,
               contributionWin: denominator > 0 ? edge.weight * (targetWin - previousWin) / denominator : 0,
               contributionExpScore: denominator > 0 ? edge.weight * (realizedExpScore - previousExpScore) / denominator : 0,
               realizedExpScore
@@ -1455,7 +2068,7 @@ export class ExpectedScoreCalculatorTs {
       let bestWin = node.winProb[turn] ?? 0;
       let bestExpScore = node.expScore[turn] ?? 0;
       const decisionBranches = node.incomingEdgeIds
-        .filter((edgeId) => this.getEdge(edgeId)?.edgeKind === EdgeKind.Decision)
+        .filter((edgeId) => this.isDecisionEdge(this.getEdge(edgeId)))
         .map((edgeId) => {
           const edge = this.getEdge(edgeId)!;
           const source = this.getNode(edge.sourceId)!;
@@ -1526,7 +2139,7 @@ export class ExpectedScoreCalculatorTs {
     let totalBranchWeight = 0;
     for (const edgeId of node.outgoingEdgeIds) {
       const edge = this.getEdge(edgeId);
-      if (!edge || edge.edgeKind !== EdgeKind.Chance) {
+      if (!this.isChanceEdge(edge) || !edge) {
         continue;
       }
 
@@ -1709,7 +2322,7 @@ export class ExpectedScoreCalculatorTs {
     let bestExpScore = -Infinity;
     for (const edgeId of node.incomingEdgeIds) {
       const edge = this.getEdge(edgeId);
-      if (edge?.edgeKind !== EdgeKind.Decision) {
+      if (!this.isDecisionEdge(edge) || !edge) {
         continue;
       }
       const source = this.getNode(edge.sourceId);

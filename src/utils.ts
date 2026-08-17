@@ -30,7 +30,7 @@ export function parseTile(token: string): number {
   return tile;
 }
 
-export function tilesToHand(tiles: Array<number | string>): Count {
+export function tilesToHand(tiles: Array<number | string>, numMelds = 0): Count {
   const hand = createCount();
   for (const rawTile of tiles) {
     const tile = typeof rawTile === "string" ? parseTile(rawTile) : rawTile;
@@ -46,11 +46,15 @@ export function tilesToHand(tiles: Array<number | string>): Count {
     }
     hand[tile] += 1;
   }
-  validateHand(hand);
+  validateHand(hand, numMelds);
   return hand;
 }
 
-export function validateHand(hand: Count): void {
+export function validateHand(hand: Count, numMelds = 0): void {
+  if (numMelds < 0 || numMelds > 4) {
+    throw new Error(`Hand must have between 0 and 4 melds: ${numMelds}`);
+  }
+
   let totalTiles = 0;
   for (let i = 0; i < 34; i += 1) {
     if (hand[i] < 0 || hand[i] > 4) {
@@ -58,8 +62,14 @@ export function validateHand(hand: Count): void {
     }
     totalTiles += hand[i];
   }
-  if (totalTiles !== 13 && totalTiles !== 14) {
-    throw new Error("Hand must have 13 or 14 tiles!");
+  // Each meld is set aside from the concealed hand, so it shrinks it by three tiles.
+  const closedTiles = 13 - numMelds * 3;
+  if (totalTiles !== closedTiles && totalTiles !== closedTiles + 1) {
+    throw new Error(
+      numMelds > 0
+        ? `Hand must have ${closedTiles} or ${closedTiles + 1} tiles with ${numMelds} meld(s)!`
+        : "Hand must have 13 or 14 tiles!"
+    );
   }
 
   for (let i = 34; i < 37; i += 1) {
